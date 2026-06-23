@@ -118,9 +118,7 @@ impl PerTypeCache {
     /// Try to fetch a cached value.  Returns `None` on miss, eviction,
     /// type-mismatch or TTL expiry.
     fn get<V: Clone + Send + Sync + 'static>(&self, args_hash: u64) -> Option<V> {
-        eprintln!("  get({}): index.len={}, data.len={}", args_hash, self.index.len(), self.data.len());
         let id_hash = self.index.get(&args_hash)?;
-        eprintln!("  get: id_hash={}", id_hash);
         let entry = self.data.get(id_hash)?;
 
         if let Some(ttl) = entry.ttl {
@@ -283,11 +281,11 @@ fn hash_value(v: impl Hash) -> u64 {
 /// }
 ///
 /// // Simulate fetching by user-id …
-/// let u = through_imc::<User, _>(42u32, || User { id: 42, name: "Alice".into() });
+/// let u: User = through_imc(42u32, || User { id: 42, name: "Alice".into() });
 /// assert_eq!(u.name, "Alice");
 ///
 /// // … and by email.  Both queries return the *same* backing `User` object.
-/// let u2 = through_imc::<User, _>("alice@example.com", || User { id: 42, name: "Alice".into() });
+/// let u2: User = through_imc("alice@example.com", || User { id: 42, name: "Alice".into() });
 /// assert_eq!(u2.name, "Alice");
 /// ```
 pub fn through_imc<T, A, F>(args: A, f: F) -> T
@@ -298,14 +296,12 @@ where
 {
     let type_id = TypeId::of::<T>();
     let args_hash = hash_value(&args);
-        eprintln!("through_imc args_hash={}", args_hash);
 
     // Fast path: read-lock check
     {
         let stores = global().stores.read().unwrap();
         if let Some(cache) = stores.get(&type_id) {
             if let Some(value) = cache.get::<T>(args_hash) {
-                eprintln!("through_imc FAST path hit");
                 return value;
             }
         }
@@ -315,7 +311,6 @@ where
     let value = f();
     let id = value.cache_id();
     let id_hash = hash_value(&id);
-    eprintln!("through_imc id_hash={}", id_hash);
     let ttl = T::cache_ttl();
 
     // Write-lock to store (deduplicates internally)
@@ -326,10 +321,9 @@ where
     cache.set::<T>(args_hash, id_hash, value, ttl);
 
     // Re-read to return the canonical copy (in case dedup kicked in)
-    eprintln!("through_imc SLOW path, trying to read back");
-    let result = cache.get::<T>(args_hash);
-    eprintln!("through_imc read back: {:?}", result.is_some());
-    result.expect("value was just stored")
+    cache
+        .get::<T>(args_hash)
+        .expect("value was just stored")
 }
 
 /// Async version of [`through_imc`].
