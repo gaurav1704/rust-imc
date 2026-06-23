@@ -3,7 +3,12 @@ name = "imc"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+invalidation-redis = ["dep:redis"]
+
 [dependencies]
+redis = { version = "0.27", optional = true }
 
 [dev-dependencies]
 serial_test = "3"

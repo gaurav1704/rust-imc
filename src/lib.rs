@@ -1,10 +1,11 @@
 use std::any::{Any, TypeId};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,12 @@ pub trait ImcCacheable: Clone + Send + Sync + 'static {
 
     /// Maximum number of entries allowed in this type’s namespace.
     fn cache_max_size() -> usize { 10_000 }
+
+    /// Optional: return a pub/sub channel name to enable cross-process
+    /// cache invalidation for this type. Requires the `invalidation-redis`
+    /// feature and a [`CacheWorker`] with
+    /// [`WorkerConfig::redis_connection_string`] configured.
+    fn cache_invalidation_channel() -> Option<&'static str> { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +72,18 @@ pub enum CacheStrategy {
     Mfu,
     /// Evict the entry that was inserted **earliest** (FIFO).
     Fifo,
+}
+
+// ---------------------------------------------------------------------------
+// Background worker command
+// ---------------------------------------------------------------------------
+
+/// Commands that can be sent to the background maintenance worker.
+enum CacheCmd {
+    Remove(TypeId, u64),
+    Clear(TypeId),
+    ClearAll,
+    Shutdown,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +126,8 @@ struct PerTypeCache {
 
 impl PerTypeCache {
     fn from_trait<T: ImcCacheable>() -> Self {
+        #[cfg(feature = "invalidation-redis")]
+        invalidation::register::<T>();
         Self {
             strategy: T::cache_strategy(),
             max_size: T::cache_max_size(),
@@ -155,8 +176,10 @@ impl PerTypeCache {
             return;
         }
 
-        // ── 3.  Evict if full ──────────────────────────────────────
-        if self.data.len() >= self.max_size {
+        // ── 3.  Evict if full (skip when background worker is active) ─
+        if self.data.len() >= self.max_size
+            && WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        {
             if let Some(evict_id) = self.evict_candidate() {
                 self.data.remove(&evict_id);
             }
@@ -214,6 +237,25 @@ impl PerTypeCache {
     fn len(&self) -> usize {
         self.data.len()
     }
+
+    /// Remove all TTL-expired entries and their stale index references.
+    fn remove_expired(&mut self) {
+        self.data.retain(|_, e| {
+            e.ttl.map_or(true, |ttl| e.created_at.elapsed() <= ttl)
+        });
+        self.index.retain(|_, id_hash| self.data.contains_key(id_hash));
+    }
+
+    /// Evict entries until `data.len() <= max_size` and clean up orphaned
+    /// index entries.
+    fn evict_to_max_size(&mut self) {
+        while self.data.len() > self.max_size {
+            if let Some(evict_id) = self.evict_candidate() {
+                self.data.remove(&evict_id);
+            }
+        }
+        self.index.retain(|_, id_hash| self.data.contains_key(id_hash));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,11 +285,40 @@ fn tick() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Deterministic FNV-1a hasher so the same value produces the same hash
+/// across processes (required for cross-process invalidation).
+struct StableHasher(u64);
+
+impl StableHasher {
+    fn new() -> Self {
+        Self(14695981039346656037)
+    }
+}
+
+impl Hasher for StableHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(1099511628211);
+        }
+    }
+}
+
 fn hash_value(v: impl Hash) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = StableHasher::new();
     v.hash(&mut h);
     h.finish()
 }
+
+// ---------------------------------------------------------------------------
+// Background worker — offloads eviction, expiry, and invalidation
+// ---------------------------------------------------------------------------
+
+/// Global sender that signals whether a background worker is active.
+static WORKER_TX: Mutex<Option<Sender<CacheCmd>>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
 // Public API – the only entry points
@@ -396,6 +467,298 @@ pub fn imc_len<T: ImcCacheable>() -> usize {
 
     let stores = global().stores.read().unwrap();
     stores.get(&type_id).map_or(0, |c| c.len())
+}
+
+// ---------------------------------------------------------------------------
+// Background worker — public API
+// ---------------------------------------------------------------------------
+
+/// Configuration for the background maintenance worker.
+#[derive(Clone, Debug)]
+pub struct WorkerConfig {
+    /// How often the background thread sweeps for expired & excess entries.
+    pub sweep_interval: Duration,
+    /// Optional Redis connection string for cross-process cache invalidation
+    /// via pub/sub. Requires the `invalidation-redis` feature.
+    #[cfg(feature = "invalidation-redis")]
+    pub redis_connection_string: Option<String>,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval: Duration::from_secs(10),
+            #[cfg(feature = "invalidation-redis")]
+            redis_connection_string: None,
+        }
+    }
+}
+
+/// A background worker that periodically sweeps the cache for TTL-expired
+/// entries and evicts over-capacity namespaces, and processes
+/// remove/clear/shutdown commands.
+///
+/// When a worker is active the hot-path `through_imc` / `through_imc_async`
+/// skip inline eviction so that the main thread is never blocked by an O(n)
+/// eviction scan.
+pub struct CacheWorker {
+    tx: Sender<CacheCmd>,
+    _handle: JoinHandle<()>,
+    #[cfg(feature = "invalidation-redis")]
+    _redis_handle: Option<JoinHandle<()>>,
+}
+
+impl CacheWorker {
+    /// Spawn a worker with default [`WorkerConfig`].
+    pub fn spawn() -> Self {
+        Self::spawn_with_config(WorkerConfig::default())
+    }
+
+    /// Spawn a worker with a custom configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a worker is already running (only one instance is allowed).
+    pub fn spawn_with_config(config: WorkerConfig) -> Self {
+        let (tx, rx) = mpsc::channel();
+
+        let mut guard = WORKER_TX.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.is_none(),
+            "an imc background worker is already running"
+        );
+        *guard = Some(tx.clone());
+
+        let cfg_for_loop = WorkerConfig {
+            sweep_interval: config.sweep_interval,
+            #[cfg(feature = "invalidation-redis")]
+            redis_connection_string: config.redis_connection_string.clone(),
+        };
+
+        let handle = std::thread::Builder::new()
+            .name("imc-worker".into())
+            .spawn(move || worker_loop(rx, cfg_for_loop))
+            .expect("failed to spawn imc worker thread");
+
+        #[cfg(feature = "invalidation-redis")]
+        let redis_handle = if let Some(ref redis_url) = config.redis_connection_string {
+            let channels = invalidation::snapshot_channels();
+            if !channels.is_empty() {
+                let url = redis_url.clone();
+                Some(
+                    std::thread::Builder::new()
+                        .name("imc-redis".into())
+                        .spawn(move || invalidation::redis_subscriber_loop(&url, channels))
+                        .expect("failed to spawn imc redis subscriber"),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Self {
+            tx,
+            _handle: handle,
+            #[cfg(feature = "invalidation-redis")]
+            _redis_handle: redis_handle,
+        }
+    }
+
+    /// Enqueue a remove-command for the given type and id.
+    pub fn remove<T: ImcCacheable>(&self, id: &T::Id) {
+        let type_id = TypeId::of::<T>();
+        let id_hash = hash_value(id);
+        let _ = self.tx.send(CacheCmd::Remove(type_id, id_hash));
+    }
+
+    /// Enqueue a clear-command for the given type.
+    pub fn clear<T: ImcCacheable>(&self) {
+        let type_id = TypeId::of::<T>();
+        let _ = self.tx.send(CacheCmd::Clear(type_id));
+    }
+
+    /// Enqueue a clear-all command (evicts every namespace).
+    pub fn clear_all(&self) {
+        let _ = self.tx.send(CacheCmd::ClearAll);
+    }
+}
+
+impl Drop for CacheWorker {
+    fn drop(&mut self) {
+        // Clear the global marker so inline eviction resumes.
+        *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Signal shutdown so the background thread joins promptly.
+        let _ = self.tx.send(CacheCmd::Shutdown);
+    }
+}
+
+fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
+    let sweep_interval = config.sweep_interval;
+
+    loop {
+        match rx.recv_timeout(sweep_interval) {
+            Ok(cmd) => match cmd {
+                CacheCmd::Remove(type_id, id_hash) => {
+                    let mut stores = global().stores.write().unwrap();
+                    if let Some(cache) = stores.get_mut(&type_id) {
+                        cache.remove_data(id_hash);
+                    }
+                }
+                CacheCmd::Clear(type_id) => {
+                    let mut stores = global().stores.write().unwrap();
+                    if let Some(cache) = stores.get_mut(&type_id) {
+                        cache.clear();
+                    }
+                }
+                CacheCmd::ClearAll => {
+                    let mut stores = global().stores.write().unwrap();
+                    stores.clear();
+                }
+                CacheCmd::Shutdown => return,
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+
+        sweep_all();
+    }
+}
+
+fn sweep_all() {
+    let type_ids: Vec<TypeId> = {
+        let stores = global().stores.read().unwrap();
+        stores.keys().copied().collect()
+    };
+
+    for type_id in type_ids {
+        let mut stores = global().stores.write().unwrap();
+        if let Some(cache) = stores.get_mut(&type_id) {
+            cache.remove_expired();
+            cache.evict_to_max_size();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process invalidation (behind optional feature)
+// ---------------------------------------------------------------------------
+
+/// Compute the stable hash string that other pods must publish to
+/// invalidate this cache entry via Redis pub/sub.
+///
+/// Only needed when the `invalidation-redis` feature is enabled **and**
+/// [`ImcCacheable::cache_invalidation_channel`] returns a channel name.
+///
+/// # Example
+///
+/// ```ignore
+/// let inval_id = imc_invalidation_id::<User>(&42);
+/// // publish `inval_id` on User's channel when User 42 is mutated
+/// redis_publish("users", inval_id);
+/// ```
+pub fn imc_invalidation_id<T: ImcCacheable>(id: &T::Id) -> String {
+    let id_hash = hash_value(id);
+    id_hash.to_string()
+}
+
+#[cfg(feature = "invalidation-redis")]
+pub(crate) mod invalidation {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct Registry {
+        channels: HashMap<String, TypeId>,
+    }
+
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<Registry> {
+        REGISTRY.get_or_init(|| Mutex::new(Registry { channels: HashMap::new() }))
+    }
+
+    pub(crate) fn register<T: ImcCacheable>() {
+        let channel = match T::cache_invalidation_channel() {
+            Some(c) => c,
+            None => return,
+        };
+        let mut reg = registry().lock().unwrap();
+        reg.channels.entry(channel.to_string()).or_insert(TypeId::of::<T>());
+    }
+
+    pub(crate) fn snapshot_channels() -> Vec<(String, TypeId)> {
+        let reg = registry().lock().unwrap();
+        reg.channels.iter().map(|(c, t)| (c.clone(), *t)).collect()
+    }
+
+    pub(crate) fn redis_subscriber_loop(redis_url: &str, channels: Vec<(String, TypeId)>) {
+        let chan_map: HashMap<String, TypeId> = channels.into_iter().collect();
+        let client = match redis::Client::open(redis_url) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("imc: failed to connect to Redis: {e}");
+                return;
+            }
+        };
+
+        loop {
+            if WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                break;
+            }
+            match run_subscriber(&client, &chan_map) {
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!("imc: Redis subscriber error: {e}, reconnecting in 5s");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    fn run_subscriber(
+        client: &redis::Client,
+        chan_map: &HashMap<String, TypeId>,
+    ) -> redis::RedisResult<()> {
+        let mut conn = client.get_connection()?;
+        conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut pubsub = conn.as_pubsub();
+
+        for channel in chan_map.keys() {
+            pubsub.subscribe(channel.as_str())?;
+        }
+
+        loop {
+            if WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                break;
+            }
+
+            match pubsub.get_message() {
+                Ok(msg) => {
+                    let channel = msg.get_channel_name();
+                    let payload: String = msg.get_payload()?;
+
+                    if let Ok(id_hash) = payload.parse::<u64>() {
+                        if let Some(&type_id) = chan_map.get(channel) {
+                            let mut stores = global().stores.write().unwrap();
+                            if let Some(cache) = stores.get_mut(&type_id) {
+                                cache.remove_data(id_hash);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.is_timeout() {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -723,5 +1086,177 @@ mod tests {
 
         let _u: User = fetch(42u32, || User { id: 42, name: "Alice".into() });
         let _u2: User = fetch("alice@example.com", || User { id: 42, name: "Alice".into() });
+    }
+
+    // ── Worker tests ────────────────────────────────────────────────
+    //
+    // Each test uses its own struct + a short sweep interval.
+
+    macro_rules! worker_strat_def {
+        ($name:ident, $strategy:expr) => {
+            #[derive(Clone, Debug, PartialEq)]
+            struct $name { id: u32, _val: u32 }
+            impl ImcCacheable for $name {
+                type Id = u32;
+                fn cache_id(&self) -> u32 { self.id }
+                fn cache_strategy() -> CacheStrategy { $strategy }
+                fn cache_max_size() -> usize { 3 }
+                fn cache_ttl() -> Option<Duration> { None }
+            }
+        };
+    }
+    worker_strat_def!(WkrLru, CacheStrategy::Lru);
+    worker_strat_def!(WkrFifo, CacheStrategy::Fifo);
+
+    #[test]
+    #[serial]
+    fn test_worker_skips_inline_eviction() {
+        imc_clear::<WkrLru>();
+
+        let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+            sweep_interval: Duration::from_secs(1),
+            #[cfg(feature = "invalidation-redis")]
+            redis_connection_string: None,
+        });
+
+        // max_size = 3 → 4 entries exceed the limit
+        fetch::<WkrLru, _>(1u32, || WkrLru { id: 1, _val: 10 });
+        fetch::<WkrLru, _>(2u32, || WkrLru { id: 2, _val: 20 });
+        fetch::<WkrLru, _>(3u32, || WkrLru { id: 3, _val: 30 });
+        fetch::<WkrLru, _>(4u32, || WkrLru { id: 4, _val: 40 });
+
+        // Inline eviction was skipped → 4 entries
+        assert_eq!(imc_len::<WkrLru>(), 4);
+    }
+
+    #[test]
+    #[serial]
+    fn test_worker_eviction_sweep() {
+        imc_clear::<WkrFifo>();
+
+        let worker = CacheWorker::spawn_with_config(WorkerConfig {
+            sweep_interval: Duration::from_secs(1),
+            #[cfg(feature = "invalidation-redis")]
+            redis_connection_string: None,
+        });
+
+        fetch::<WkrFifo, _>(1u32, || WkrFifo { id: 1, _val: 10 });
+        fetch::<WkrFifo, _>(2u32, || WkrFifo { id: 2, _val: 20 });
+        fetch::<WkrFifo, _>(3u32, || WkrFifo { id: 3, _val: 30 });
+        fetch::<WkrFifo, _>(4u32, || WkrFifo { id: 4, _val: 40 });
+        assert_eq!(imc_len::<WkrFifo>(), 4);
+
+        // Send a dummy command to trigger an immediate sweep
+        worker.remove::<WkrFifo>(&999);
+
+        // Give the worker a moment to process (sweep will evict to 3)
+        for _ in 0..50 {
+            if imc_len::<WkrFifo>() <= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(imc_len::<WkrFifo>(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_worker_inline_eviction_resumes_after_drop() {
+        imc_clear::<WkrFifo>();
+
+        let worker = CacheWorker::spawn_with_config(WorkerConfig {
+            sweep_interval: Duration::from_secs(1),
+            #[cfg(feature = "invalidation-redis")]
+            redis_connection_string: None,
+        });
+
+        // Fill past max_size — inline eviction is skipped
+        fetch::<WkrFifo, _>(10u32, || WkrFifo { id: 10, _val: 100 });
+        fetch::<WkrFifo, _>(20u32, || WkrFifo { id: 20, _val: 200 });
+        fetch::<WkrFifo, _>(30u32, || WkrFifo { id: 30, _val: 300 });
+        fetch::<WkrFifo, _>(40u32, || WkrFifo { id: 40, _val: 400 });
+        assert_eq!(imc_len::<WkrFifo>(), 4);
+
+        // Drop the worker → global marker cleared
+        drop(worker);
+
+        // Inline eviction fires on each insert (4 → evict 1 → 3 → insert → 4)
+        fetch::<WkrFifo, _>(50u32, || WkrFifo { id: 50, _val: 500 });
+        assert_eq!(imc_len::<WkrFifo>(), 4);
+
+        // A second insert evicts another, confirming eviction is active
+        fetch::<WkrFifo, _>(60u32, || WkrFifo { id: 60, _val: 600 });
+        assert_eq!(imc_len::<WkrFifo>(), 4);
+    }
+
+    #[test]
+    #[serial]
+    fn test_worker_remove_via_command() {
+        imc_clear::<WkrLru>();
+
+        let worker = CacheWorker::spawn_with_config(WorkerConfig {
+            sweep_interval: Duration::from_secs(1),
+            #[cfg(feature = "invalidation-redis")]
+            redis_connection_string: None,
+        });
+
+        fetch::<WkrLru, _>(1u32, || WkrLru { id: 1, _val: 10 });
+        fetch::<WkrLru, _>(2u32, || WkrLru { id: 2, _val: 20 });
+        assert_eq!(imc_len::<WkrLru>(), 2);
+
+        worker.remove::<WkrLru>(&1);
+
+        for _ in 0..50 {
+            if imc_len::<WkrLru>() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(imc_len::<WkrLru>(), 1);
+
+        // Verify the removed entry actually misses
+        let miss: WkrLru = fetch(1u32, || WkrLru { id: 1, _val: 999 });
+        assert_eq!(miss._val, 999);
+    }
+
+    // ── Invalidation tests ──────────────────────────────────────────
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct InvalWidget { id: u32, name: String }
+
+    impl ImcCacheable for InvalWidget {
+        type Id = u32;
+        fn cache_id(&self) -> u32 { self.id }
+        fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+        fn cache_max_size() -> usize { 100 }
+        fn cache_ttl() -> Option<Duration> { None }
+        fn cache_invalidation_channel() -> Option<&'static str> { Some("inval_widget") }
+    }
+
+    #[test]
+    fn test_imc_invalidation_id_is_deterministic() {
+        let a = imc_invalidation_id::<InvalWidget>(&42);
+        let b = imc_invalidation_id::<InvalWidget>(&42);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_imc_invalidation_id_differs_for_diff_ids() {
+        let a = imc_invalidation_id::<InvalWidget>(&1);
+        let b = imc_invalidation_id::<InvalWidget>(&2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    #[cfg(feature = "invalidation-redis")]
+    fn test_invalidation_registry() {
+        // InvalWidget was defined above, so it should have been registered
+        // when PerTypeCache::from_trait::<InvalWidget>() runs.
+        // Trigger first-use:
+        imc_clear::<InvalWidget>();
+        let _ = fetch::<InvalWidget, _>(99u32, || InvalWidget { id: 99, name: "x".into() });
+
+        let channels = invalidation::snapshot_channels();
+        assert!(channels.iter().any(|(c, _)| c == "inval_widget"));
     }
 }
