@@ -37,13 +37,20 @@ Every setting is defined **per-type** via the `ImcCacheable` trait.
 - **Values:** `Lru` / `Mru` / `Lfu` / `Mfu` / `Fifo`
 - **Behaviour:**
 
-| Strategy | Evicts … | Ordered by |
-|----------|----------|------------|
-| `Lru` | Least Recently Used | `last_accessed` timestamp |
-| `Mru` | Most Recently Used | `last_accessed` timestamp |
-| `Lfu` | Least Frequently Used | `access_count` |
-| `Mfu` | Most Frequently Used | `access_count` |
-| `Fifo` | Earliest inserted | `inserted_at` timestamp |
+#### `Lru` — Least Recently Used
+Evicts the entry whose `last_accessed` timestamp is the oldest — i.e., the one that has gone the longest without being read. Good general-purpose default for most workloads where recently accessed data is likely to be accessed again soon. Each `get()` updates the timestamp.
+
+#### `Mru` — Most Recently Used
+Evicts the entry whose `last_accessed` timestamp is the newest — i.e., the one that was just read. Useful when older data is more valuable (e.g., caches for sequential-scan or streaming workloads where the latest item is unlikely to be re-read).
+
+#### `Lfu` — Least Frequently Used
+Evicts the entry with the lowest `access_count`. Keeps frequently accessed data warm, even if it hasn't been touched recently. Each `get()` increments the counter. Good for workloads with a stable "hot set" of popular records.
+
+#### `Mfu` — Most Frequently Used
+Evicts the entry with the highest `access_count`. Makes room for fresh entries by discarding the most popular one. Useful in specialized cases where you want to force rotation of heavily accessed data.
+
+#### `Fifo` — First In, First Out
+Evicts the entry that was inserted earliest (`inserted_at`). Ignores access patterns entirely — no timestamp or counter is updated. Simple and predictable; useful when all entries are equally likely to be re-read and you just need a size cap.
 
 ### `cache_ttl()`
 - **Purpose:** Time-to-live for entries in this namespace.
