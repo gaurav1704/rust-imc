@@ -56,10 +56,10 @@ pub(crate) static WORKER_TX: Mutex<Option<Sender<CacheCmd>>> = Mutex::new(None);
 pub struct WorkerConfig {
     /// How often the background thread sweeps for expired & excess entries.
     pub sweep_interval: Duration,
-    /// Optional Prometheus Push Gateway URL for metric export.
-    /// Requires the `metrics-prometheus` feature.
+    /// Optional listen address for the Prometheus metrics HTTP endpoint
+    /// (e.g. `"127.0.0.1:9090"`). Requires the `metrics-prometheus` feature.
     #[cfg(feature = "metrics-prometheus")]
-    pub prometheus_push_gateway: Option<String>,
+    pub metrics_listen_addr: Option<String>,
     /// Optional Redis connection string for cross-process cache invalidation
     /// via pub/sub. Requires the `invalidation-redis` feature.
     #[cfg(feature = "invalidation-redis")]
@@ -71,7 +71,7 @@ impl Default for WorkerConfig {
         Self {
             sweep_interval: Duration::from_secs(10),
             #[cfg(feature = "metrics-prometheus")]
-            prometheus_push_gateway: None,
+            metrics_listen_addr: None,
             #[cfg(feature = "invalidation-redis")]
             redis_connection_string: None,
         }
@@ -94,6 +94,8 @@ pub struct CacheWorker {
     _handle: WorkerJoinHandle,
     #[cfg(feature = "invalidation-redis")]
     _redis_handle: Option<WorkerJoinHandle>,
+    #[cfg(feature = "metrics-prometheus")]
+    _metrics_handle: Option<WorkerJoinHandle>,
 }
 
 impl CacheWorker {
@@ -120,7 +122,7 @@ impl CacheWorker {
         let cfg_for_loop = WorkerConfig {
             sweep_interval: config.sweep_interval,
             #[cfg(feature = "metrics-prometheus")]
-            prometheus_push_gateway: config.prometheus_push_gateway.clone(),
+            metrics_listen_addr: config.metrics_listen_addr.clone(),
             #[cfg(feature = "invalidation-redis")]
             redis_connection_string: config.redis_connection_string.clone(),
         };
@@ -142,6 +144,19 @@ impl CacheWorker {
             None
         };
 
+        #[cfg(feature = "metrics-prometheus")]
+        let metrics_handle = if let Some(ref addr) = config.metrics_listen_addr {
+            let addr = addr.clone();
+            Some(spawn_worker_thread("imc-metrics", move || {
+                if let Err(e) = crate::metrics::serve(&addr) {
+                    crate::log_event!(ERROR, crate::log::METRICS, crate::log::ERROR,
+                        "metrics server on {} failed: {}", addr, e);
+                }
+            }))
+        } else {
+            None
+        };
+
         crate::log_event!(INFO, crate::log::WORKER, crate::log::START,
             sweep_interval = ?config.sweep_interval);
 
@@ -150,6 +165,8 @@ impl CacheWorker {
             _handle: handle,
             #[cfg(feature = "invalidation-redis")]
             _redis_handle: redis_handle,
+            #[cfg(feature = "metrics-prometheus")]
+            _metrics_handle: metrics_handle,
         }
     }
 
@@ -186,16 +203,6 @@ impl Drop for CacheWorker {
 
 pub(crate) fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
     let sweep_interval = config.sweep_interval;
-    let push_gateway = {
-        #[cfg(feature = "metrics-prometheus")]
-        {
-            config.prometheus_push_gateway.clone()
-        }
-        #[cfg(not(feature = "metrics-prometheus"))]
-        {
-            None::<String>
-        }
-    };
 
     loop {
         match rx.recv_timeout(sweep_interval) {
@@ -231,14 +238,6 @@ pub(crate) fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
         }
 
         sweep_all();
-
-        #[allow(unused_variables)]
-        if let Some(ref url) = push_gateway {
-            if let Err(e) = crate::metrics::push(url) {
-                crate::log_event!(WARN, crate::log::WORKER, crate::log::ERROR,
-                    "failed to push metrics: {}", e);
-            }
-        }
     }
 }
 

@@ -15,7 +15,7 @@ metrics-prometheus = ["dep:prometheus"]
 redis = { version = "0.27", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread"] }
 tracing = { version = "0.1", optional = true }
-prometheus = { version = "0.13", optional = true, features = ["push"] }
+prometheus = { version = "0.13", optional = true }
 
 [dev-dependencies]
 serial_test = "3"

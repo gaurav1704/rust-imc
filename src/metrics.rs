@@ -4,7 +4,7 @@
 
 #[cfg(feature = "metrics-prometheus")]
 pub(crate) mod inner {
-    use prometheus::{Counter, Gauge, Registry};
+    use prometheus::{Counter, Gauge, Registry, TextEncoder};
     use std::sync::OnceLock;
 
     struct Metrics {
@@ -13,6 +13,7 @@ pub(crate) mod inner {
         sets: Counter,
         evictions: Counter,
         expired: Counter,
+        invalidation_received: Counter,
         entries: Gauge,
         registry: Registry,
     }
@@ -37,6 +38,11 @@ pub(crate) mod inner {
                 "Total number of expired entries removed",
             )
             .expect("metric imc_cache_expired_total");
+            let invalidation_received = Counter::new(
+                "imc_cache_invalidation_received_total",
+                "Total number of cross-process invalidation messages received",
+            )
+            .expect("metric imc_cache_invalidation_received_total");
             let entries =
                 Gauge::new("imc_cache_entries", "Current number of cached entries")
                     .expect("metric imc_cache_entries");
@@ -57,10 +63,22 @@ pub(crate) mod inner {
                 .register(Box::new(expired.clone()))
                 .expect("register expired");
             registry
+                .register(Box::new(invalidation_received.clone()))
+                .expect("register invalidation_received");
+            registry
                 .register(Box::new(entries.clone()))
                 .expect("register entries");
 
-            Metrics { hits, misses, sets, evictions, expired, entries, registry }
+            Metrics {
+                hits,
+                misses,
+                sets,
+                evictions,
+                expired,
+                invalidation_received,
+                entries,
+                registry,
+            }
         })
     }
 
@@ -84,19 +102,61 @@ pub(crate) mod inner {
         metrics().expired.inc_by(count as f64);
     }
 
+    pub fn record_invalidation_received() {
+        metrics().invalidation_received.inc();
+    }
+
     pub fn set_entries(count: usize) {
         metrics().entries.set(count as f64);
     }
 
-    /// Push all metrics to a Prometheus Push Gateway.
+    /// Encode all metrics as Prometheus text format (for HTTP scraping).
+    pub fn encode() -> String {
+        let metric_families = metrics().registry.gather();
+        TextEncoder::new()
+            .encode_to_string(&metric_families)
+            .unwrap_or_default()
+    }
+
+    /// Start a simple HTTP server on `addr` that serves `/metrics` for
+    /// Prometheus scraping.
+    ///
+    /// Blocks the calling thread indefinitely. Run in a background thread:
     ///
     /// ```ignore
-    /// metrics::push("http://pushgateway:9091").unwrap();
+    /// std::thread::spawn(|| metrics::serve("127.0.0.1:9090"));
     /// ```
-    pub fn push(gateway_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let metric_families = metrics().registry.gather();
-        let labels = std::collections::HashMap::<String, String>::new();
-        prometheus::push_metrics("imc", labels, gateway_url, metric_families, None)?;
+    pub fn serve(addr: &str) -> std::io::Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(addr)?;
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut buf = [0u8; 1024];
+            let n = match stream.read(&mut buf) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
+
+            if request.starts_with("GET /metrics ") || request.starts_with("GET /metrics\r\n") {
+                let body = encode();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            } else {
+                let response =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
         Ok(())
     }
 }
@@ -107,16 +167,24 @@ pub(crate) mod inner {
 
 #[cfg(not(feature = "metrics-prometheus"))]
 pub(crate) mod inner {
+    #![allow(dead_code, unused_imports)]
     pub fn record_hit() {}
     pub fn record_miss() {}
     pub fn record_set() {}
     pub fn record_eviction() {}
     pub fn record_expired(_count: u64) {}
+    pub fn record_invalidation_received() {}
     pub fn set_entries(_count: usize) {}
-    pub fn push(_gateway_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn encode() -> String {
+        String::new()
+    }
+    pub fn serve(_addr: &str) -> std::io::Result<()> {
         Ok(())
     }
 }
 
-// Re-export for convenient access
-pub(crate) use inner::{push, record_eviction, record_expired, record_hit, record_miss, record_set, set_entries};
+#[cfg_attr(not(feature = "metrics-prometheus"), allow(unused_imports))]
+pub(crate) use inner::{
+    encode, record_eviction, record_expired, record_hit, record_invalidation_received, record_miss,
+    record_set, serve, set_entries,
+};

@@ -8,6 +8,7 @@ pub const CACHE: &str = "cache";
 pub const WORKER: &str = "worker";
 pub const API: &str = "api";
 pub const INVALIDATION: &str = "invalidation";
+pub const METRICS: &str = "metrics";
 
 pub const HIT: &str = "hit";
 pub const MISS: &str = "miss";

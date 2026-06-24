@@ -71,6 +71,7 @@ Evicts the entry that was inserted earliest (`inserted_at`). Ignores access patt
 - **Purpose:** Configuration for the background maintenance worker.
 - **Fields:**
   - `sweep_interval: Duration` — how often the worker sweeps for expired and excess entries (default: 10s)
+  - `metrics_listen_addr: Option<String>` — listen address for the Prometheus `/metrics` HTTP endpoint (e.g. `"127.0.0.1:9090"`). Requires the `metrics-prometheus` feature.
   - `redis_connection_string: Option<String>` — Redis URL for invalidation (only when `invalidation-redis` feature is enabled)
 - **Behaviour:** The worker runs a single background thread that receives remove/clear/shutdown commands and periodically calls `remove_expired()` + `evict_to_max_size()` on every registered type. While the worker is active, inline eviction in `set()` is skipped to keep the hot path lock-free.
 
@@ -112,18 +113,19 @@ flowchart TD
         Z --> AA["Redis Pub/Sub"]
         AA --> AB["Subscriber thread<br/>(per pod)"]
         AB --> AC["parse hash →<br/>remove_data(type_id, hash)"]
+        AB -.->|"record metric"| PE
     end
 
     subgraph PD["Prometheus Metrics (feature: metrics-prometheus)"]
-        PE["metrics::record_hit / record_miss /<br/>record_set / record_eviction / record_expired<br/>set_entries"] --> PF["Local counters & gauges"]
-        PF --> PG["metrics::push(gateway_url)"]
-        PG --> PH["Prometheus Push Gateway"]
+        PE["metrics::record_hit / record_miss /<br/>record_set / record_eviction /<br/>record_expired / record_invalidation_received<br/>set_entries"] --> PF["Local counters & gauges<br/>(prometheus::Registry)"]
+        PF --> PG["HTTP server on metrics_listen_addr<br/>GET /metrics → TextEncoder"]
+        PG --> PH["Prometheus scraper pulls<br/> /metrics endpoint"]
     end
 
     B -.->|"on hit"| PE
     D -.->|"on miss"| PE
     G -.->|"on set/evict/expiry"| PE
-    O -.->|"after sweep"| PG
+    O -.->|"after sweep updates entries"| PF
 
     O -.->|"Deferred eviction"| G
     X -.->|"On mutation"| O
@@ -133,21 +135,29 @@ flowchart TD
 
 ## Prometheus Metrics
 
-When the `metrics-prometheus` feature is enabled, imc maintains a set of counters and a gauge that track cache behaviour. These are pushed to a Prometheus Push Gateway from the background worker loop after each sweep.
+When the `metrics-prometheus` feature is enabled, imc maintains a set of counters and a gauge that track cache behaviour. An optional HTTP server exposes them as a Prometheus-scrapable `/metrics` endpoint.
 
 ### Configuration
 
-Set `prometheus_push_gateway` in `WorkerConfig` to point at your Push Gateway:
+Set `metrics_listen_addr` in `WorkerConfig` to spawn the metrics HTTP server:
 
 ```rust
 let _worker = CacheWorker::spawn_with_config(WorkerConfig {
     sweep_interval: Duration::from_secs(10),
-    prometheus_push_gateway: Some("http://pushgateway:9091".into()),
+    metrics_listen_addr: Some("127.0.0.1:9090".into()),
     ..Default::default()
 });
 ```
 
-Metrics are pushed once per sweep cycle (every `sweep_interval`).
+Prometheus scrapes the endpoint directly — no push gateway needed:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'imc'
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+```
 
 ### Metric Reference
 
@@ -158,28 +168,24 @@ Metrics are pushed once per sweep cycle (every `sweep_interval`).
 | `imc_cache_sets_total` | Counter | — | Total number of cache insertions (new entries and dedups). Incremented in `PerTypeCache::set()`. |
 | `imc_cache_evictions_total` | Counter | — | Total number of entries evicted to stay within `cache_max_size()`. Incremented on inline eviction (`set()`) and background sweep eviction (`evict_to_max_size()`). |
 | `imc_cache_expired_total` | Counter | — | Total number of TTL-expired entries removed. Incremented in `remove_expired()` and `clear()`. |
+| `imc_cache_invalidation_received_total` | Counter | — | Total number of cross-process invalidation messages received from Redis pub/sub and processed. |
 | `imc_cache_entries` | Gauge | — | Current number of unique entries across all cached types. Updated on every `imc_len()` call and after each sweep. |
 
-### Consuming Metrics
+### Manual Access
 
-Point Prometheus to scrape the Push Gateway:
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'imc'
-    static_configs:
-      - targets: ['pushgateway:9091']
-```
-
-Or use any Prometheus Push Gateway compatible system (e.g. Grafana Cloud, VictoriaMetrics).
-
-### Manual Push
-
-You can also push metrics ad-hoc from application code:
+Encode metrics as Prometheus text format at any point:
 
 ```rust
-imc::metrics::push("http://pushgateway:9091").unwrap();
+let text = imc::metrics::encode();
+println!("{text}");
+```
+
+Or start the HTTP server independently:
+
+```rust
+std::thread::spawn(|| {
+    imc::metrics::serve("127.0.0.1:9090").unwrap();
+});
 ```
 
 ---

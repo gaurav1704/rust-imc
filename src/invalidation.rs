@@ -89,6 +89,8 @@ fn run_subscriber(
                 crate::log_event!(DEBUG, crate::log::INVALIDATION, crate::log::REMOVE,
                     channel = channel, payload = &payload);
 
+                crate::metrics::record_invalidation_received();
+
                 if let Ok(id_hash) = payload.parse::<u64>() {
                     if let Some(&type_id) = chan_map.get(channel) {
                         let mut stores = global().stores.write().unwrap();
