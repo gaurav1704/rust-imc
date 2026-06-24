@@ -386,3 +386,74 @@ Key points:
 - Only the mutating pod needs to call `publish_invalidation` — imc does not auto-publish.
 - The hash is computed with the same FNV-1a `StableHasher` on every pod, so all pods agree on which entry to remove.
 - Subscribers automatically reconnect on error with a 5-second backoff.
+
+### Multi-condition queries & cached result sets
+
+Tuple args let you cache queries with multiple WHERE clauses. Combined with the `Vec<T>` blanket impl, entire filtered result sets are cached and deduplicated.
+
+```rust
+use imc::{CacheStrategy, ImcCacheable, through_imc};
+use std::time::Duration;
+
+// ── 1.  A domain type ──────────────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub struct User {
+    pub id: i32,
+    pub name: String,
+    pub region: String,
+    pub age: i32,
+}
+
+impl ImcCacheable for User {
+    type Id = i32;
+    fn cache_id(&self) -> i32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(120)) }
+    fn cache_max_size() -> usize { 5_000 }
+}
+
+// ── 2.  Single-row query with two conditions ───────────────────────────
+// The args tuple (age, region) becomes the cache key.
+// A second call with the same pair hits the cache.
+fn get_users_by_age_and_region(age: i32, region: &str) -> User {
+    through_imc((age, region.to_string()), || {
+        // e.g. SELECT * FROM users WHERE age > $1 AND region = $2
+        fetch_user_raw(age, region)
+    })
+}
+
+// ── 3.  Result set (Vec) with the same conditions ──────────────────────
+// Vec<User> implements ImcCacheable automatically — cache_id() hashes
+// all element IDs together.  Two different queries that return the same
+// logical set of users share one cached Vec.
+fn get_all_users_by_age_and_region(age: i32, region: &str) -> Vec<User> {
+    through_imc(("list", age, region.to_string()), || {
+        // e.g. SELECT * FROM users WHERE age > $1 AND region = $2
+        fetch_users_raw(age, region)
+    })
+}
+
+// ── 4.  Mix and match ──────────────────────────────────────────────────
+// Tuples with different shapes are distinct cache keys:
+let _ = get_users_by_age_and_region(10, "india");     // key: (10, "india")
+let _ = get_all_users_by_age_and_region(10, "india"); // key: ("list", 10, "india") → different namespace
+```
+
+Any tuple of `Hash + Clone + Send + 'static` values works as the cache key: `(i32, String)`, `(bool, u64, String)`, etc. The `Vec<T>` blanket means you never need a wrapper type for result sets.
+
+### Per-value size limit
+
+Prevent large values from wasting cache capacity by implementing `cache_value_size()`:
+
+```rust
+impl ImcCacheable for User {
+    // …
+    fn cache_value_size(&self) -> Option<usize> {
+        Some(std::mem::size_of::<i32>() * 3 + self.name.len() + self.region.len())
+    }
+    fn cache_max_value_size() -> usize { 65_536 } // 64 KiB
+}
+
+// Values larger than 64 KiB bypass the cache entirely:
+let big = through_imc("large_blob", || fetch_huge_user()); // never stored
+```
