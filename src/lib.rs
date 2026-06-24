@@ -1,10 +1,12 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+#[cfg(any(feature = "async", feature = "tokio"))]
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock, RwLock};
+#[cfg(not(feature = "tokio"))]
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -398,6 +400,9 @@ where
 }
 
 /// Async version of [`through_imc`].
+///
+/// Requires the `async` or `tokio` feature.
+#[cfg(any(feature = "async", feature = "tokio"))]
 pub async fn through_imc_async<T, A, F, Fut>(args: A, f: F) -> T
 where
     T: ImcCacheable,
@@ -473,6 +478,27 @@ pub fn imc_len<T: ImcCacheable>() -> usize {
 // Background worker — public API
 // ---------------------------------------------------------------------------
 
+/// Platform-agnostic join handle: `std::thread::JoinHandle` or
+/// `tokio::task::JoinHandle` depending on the `tokio` feature.
+#[cfg(not(feature = "tokio"))]
+type WorkerJoinHandle = JoinHandle<()>;
+#[cfg(feature = "tokio")]
+type WorkerJoinHandle = tokio::task::JoinHandle<()>;
+
+/// Spawn a long-lived background thread (or tokio blocking-task when the
+/// `tokio` feature is active).
+#[cfg(not(feature = "tokio"))]
+fn spawn_worker_thread(name: &'static str, f: impl FnOnce() + Send + 'static) -> WorkerJoinHandle {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(f)
+        .expect("failed to spawn imc worker thread")
+}
+#[cfg(feature = "tokio")]
+fn spawn_worker_thread(_name: &'static str, f: impl FnOnce() + Send + 'static) -> WorkerJoinHandle {
+    tokio::task::spawn_blocking(f)
+}
+
 /// Configuration for the background maintenance worker.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -503,9 +529,9 @@ impl Default for WorkerConfig {
 /// eviction scan.
 pub struct CacheWorker {
     tx: Sender<CacheCmd>,
-    _handle: JoinHandle<()>,
+    _handle: WorkerJoinHandle,
     #[cfg(feature = "invalidation-redis")]
-    _redis_handle: Option<JoinHandle<()>>,
+    _redis_handle: Option<WorkerJoinHandle>,
 }
 
 impl CacheWorker {
@@ -535,22 +561,16 @@ impl CacheWorker {
             redis_connection_string: config.redis_connection_string.clone(),
         };
 
-        let handle = std::thread::Builder::new()
-            .name("imc-worker".into())
-            .spawn(move || worker_loop(rx, cfg_for_loop))
-            .expect("failed to spawn imc worker thread");
+        let handle = spawn_worker_thread("imc-worker", move || worker_loop(rx, cfg_for_loop));
 
         #[cfg(feature = "invalidation-redis")]
         let redis_handle = if let Some(ref redis_url) = config.redis_connection_string {
             let channels = invalidation::snapshot_channels();
             if !channels.is_empty() {
                 let url = redis_url.clone();
-                Some(
-                    std::thread::Builder::new()
-                        .name("imc-redis".into())
-                        .spawn(move || invalidation::redis_subscriber_loop(&url, channels))
-                        .expect("failed to spawn imc redis subscriber"),
-                )
+                Some(spawn_worker_thread("imc-redis", move || {
+                    invalidation::redis_subscriber_loop(&url, channels)
+                }))
             } else {
                 None
             }
@@ -770,6 +790,17 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    /// Enter a tokio runtime context when the `tokio` feature is active.
+    /// Declared at the start of any test that calls `CacheWorker::spawn`.
+    macro_rules! enter_tokio {
+        () => {
+            #[cfg(feature = "tokio")]
+            let _tokio_rt = tokio::runtime::Runtime::new().unwrap();
+            #[cfg(feature = "tokio")]
+            let _tokio_guard = _tokio_rt.enter();
+        };
+    }
 
     // ── Test helpers ─────────────────────────────────────────────────
 
@@ -1111,6 +1142,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_worker_skips_inline_eviction() {
+        enter_tokio!();
         imc_clear::<WkrLru>();
 
         let _worker = CacheWorker::spawn_with_config(WorkerConfig {
@@ -1132,6 +1164,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_worker_eviction_sweep() {
+        enter_tokio!();
         imc_clear::<WkrFifo>();
 
         let worker = CacheWorker::spawn_with_config(WorkerConfig {
@@ -1162,6 +1195,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_worker_inline_eviction_resumes_after_drop() {
+        enter_tokio!();
         imc_clear::<WkrFifo>();
 
         let worker = CacheWorker::spawn_with_config(WorkerConfig {
@@ -1192,6 +1226,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_worker_remove_via_command() {
+        enter_tokio!();
         imc_clear::<WkrLru>();
 
         let worker = CacheWorker::spawn_with_config(WorkerConfig {

@@ -5,10 +5,13 @@ edition = "2024"
 
 [features]
 default = []
+async = []
+tokio = ["dep:tokio", "async"]
 invalidation-redis = ["dep:redis"]
 
 [dependencies]
 redis = { version = "0.27", optional = true }
+tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 serial_test = "3"

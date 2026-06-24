@@ -14,7 +14,9 @@ assert_eq!(user.id, same.id); // same backing entry
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| — | always | Core caching: `through_imc`, `through_imc_async`, dedup, eviction, TTL |
+| — | always | Core caching: `through_imc`, dedup, eviction, TTL |
+| `async` | no | Enables `through_imc_async` for async closure support (runtime-agnostic) |
+| `tokio` | no | Implies `async` + makes `CacheWorker` use `tokio::task::spawn_blocking` instead of `std::thread` |
 | `invalidation-redis` | no | Cross-process cache invalidation via Redis pub/sub (optional `redis` crate dep) |
 
 ---
