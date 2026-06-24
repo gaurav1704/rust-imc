@@ -40,6 +40,12 @@ pub trait ImcCacheable: Clone + Send + Sync + 'static {
     /// The unique-identifier type for this data (e.g. a primary key).
     type Id: Hash + Eq + Clone + Send + 'static;
 
+    /// Typed cache key for use with [`through_imc_keyed`](crate::through_imc_keyed).
+    ///
+    /// All types must specify this (typically `type Key = String;`).  Override
+    /// with a closed enum to make invalid cache keys a compile-time error.
+    type Key: Hash + Clone + Send + 'static;
+
     /// Extract the unique identifier from a value *after* it has been
     /// fetched.  This is used internally to deduplicate entries.
     fn cache_id(&self) -> Self::Id;
@@ -86,6 +92,7 @@ pub trait ImcCacheable: Clone + Send + Sync + 'static {
 
 impl<T: ImcCacheable> ImcCacheable for Vec<T> {
     type Id = String;
+    type Key = String;
 
     fn cache_id(&self) -> String {
         let ids: Vec<T::Id> = self.iter().map(|e| e.cache_id()).collect();

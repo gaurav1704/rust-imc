@@ -460,3 +460,28 @@ impl ImcCacheable for User {
 // Values larger than 64 KiB bypass the cache entirely:
 let big = through_imc("large_blob", || fetch_huge_user()); // never stored
 ```
+
+### Typed cache keys
+
+By default `through_imc` accepts any `Hash + Clone + Send + 'static` value as a key — flexible, but a typo in a string key silently creates a different cache entry. Override the `Key` associated type on `ImcCacheable` with a closed enum to make invalid keys a compile-time error:
+
+```rust
+use imc::{CacheStrategy, ImcCacheable, through_imc_keyed};
+
+#[derive(Hash, Clone)]
+enum UserKey { ById(i32), ByEmail(String) }
+
+impl ImcCacheable for User {
+    type Id = i32;
+    type Key = UserKey;
+    // … other trait methods unchanged
+}
+
+// Compiler-enforced keys:
+through_imc_keyed(UserKey::ById(42), || fetch_user_by_id(42));
+through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || fetch_user_by_email("alice@example.com"));
+
+// through_imc_keyed("anything", || …); // ✗ compile error — wrong type
+```
+
+The original `through_imc` (free-form key) and `through_imc_keyed` (typed key) coexist — use whichever fits your call site. Async equivalents `through_imc_async` / `through_imc_keyed_async` are available under the `async` or `tokio` features.

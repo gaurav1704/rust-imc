@@ -15,10 +15,10 @@ mod tests;
 
 pub use traits::{CacheStrategy, ImcCacheable};
 pub use worker::{CacheWorker, WorkerConfig};
-pub use api::{through_imc, imc_remove, imc_clear, imc_len, imc_invalidation_id};
+pub use api::{through_imc, through_imc_keyed, imc_remove, imc_clear, imc_len, imc_invalidation_id};
 
 #[cfg(any(feature = "async", feature = "tokio"))]
-pub use api::through_imc_async;
+pub use api::{through_imc_async, through_imc_keyed_async};
 
 // ---------------------------------------------------------------------------
 // Library lifecycle

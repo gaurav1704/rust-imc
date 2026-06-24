@@ -183,8 +183,11 @@ pub(crate) mod inner {
     }
 }
 
-#[cfg_attr(not(feature = "metrics-prometheus"), allow(unused_imports))]
+#[cfg_attr(
+    not(feature = "metrics-prometheus"),
+    allow(unused_imports)
+)]
 pub(crate) use inner::{
-    encode, record_eviction, record_expired, record_hit, record_invalidation_received, record_miss,
+    record_eviction, record_expired, record_hit, record_invalidation_received, record_miss,
     record_set, serve, set_entries,
 };

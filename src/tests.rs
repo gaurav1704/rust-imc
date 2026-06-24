@@ -29,6 +29,7 @@ struct Widget {
 
 impl ImcCacheable for Widget {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 10_000 }
@@ -50,6 +51,7 @@ macro_rules! strat_def {
         struct $name { id: u32, _val: u32 }
         impl ImcCacheable for $name {
             type Id = u32;
+            type Key = String;
             fn cache_id(&self) -> u32 { self.id }
             fn cache_strategy() -> CacheStrategy { $strategy }
             fn cache_max_size() -> usize { 3 }
@@ -219,6 +221,7 @@ fn test_max_size_enforced() {
     struct SmallWidget { id: u32, _val: u32 }
     impl ImcCacheable for SmallWidget {
         type Id = u32;
+        type Key = String;
         fn cache_id(&self) -> u32 { self.id }
         fn cache_strategy() -> CacheStrategy { CacheStrategy::Fifo }
         fn cache_max_size() -> usize { 2 }
@@ -238,6 +241,73 @@ fn test_max_size_enforced() {
 }
 
 // ---------------------------------------------------------------------------
+// Keyed API tests
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+struct KeyedWidget { id: u32, label: String }
+
+#[derive(Hash, Clone, PartialEq, Eq)]
+enum KeyedWidgetKey { ById(u32), ByLabel(String) }
+
+impl ImcCacheable for KeyedWidget {
+    type Id = u32;
+    type Key = KeyedWidgetKey;
+
+    fn cache_id(&self) -> u32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_max_size() -> usize { 100 }
+    fn cache_ttl() -> Option<Duration> { None }
+}
+
+#[test]
+#[serial]
+fn test_keyed_strict_enum() {
+    imc_clear::<KeyedWidget>();
+    let call_count = AtomicU32::new(0);
+
+    let r1: KeyedWidget = through_imc_keyed(KeyedWidgetKey::ByLabel("alice".into()), || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        KeyedWidget { id: 1, label: "alice".into() }
+    });
+    assert_eq!(r1.id, 1);
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+
+    let r2: KeyedWidget = through_imc_keyed(KeyedWidgetKey::ByLabel("alice".into()), || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        KeyedWidget { id: 1, label: "WRONG".into() }
+    });
+    assert_eq!(r2.id, 1);
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+#[serial]
+fn test_keyed_dedup_across_variants() {
+    imc_clear::<KeyedWidget>();
+    let call_count = AtomicU32::new(0);
+
+    let r1: KeyedWidget = through_imc_keyed(KeyedWidgetKey::ByLabel("bob".into()), || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        KeyedWidget { id: 2, label: "bob".into() }
+    });
+    assert_eq!(r1.id, 2);
+
+    // Different key variant → miss at key lookup, so closure runs.
+    // But the value is deduped at set time (same id → old entry kept).
+    let r2: KeyedWidget = through_imc_keyed(KeyedWidgetKey::ById(2), || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        KeyedWidget { id: 2, label: "WRONG".into() }
+    });
+    // r2 should see the deduped (first) copy
+    assert_eq!(r2.label, "bob");
+    assert_eq!(r2.id, 2);
+    // Closure ran twice (two distinct keys), but the second value was discarded
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(imc_len::<KeyedWidget>(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // TTL tests
 // ---------------------------------------------------------------------------
 
@@ -245,6 +315,7 @@ fn test_max_size_enforced() {
 struct TtlWidget { id: u32, val: u32 }
 impl ImcCacheable for TtlWidget {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 100 }
@@ -285,6 +356,7 @@ fn test_ttl_expiry() {
 struct NoTtlWidget { id: u32, val: u32 }
 impl ImcCacheable for NoTtlWidget {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 100 }
@@ -323,6 +395,7 @@ fn doc_example() {
 
     impl ImcCacheable for User {
         type Id = u32;
+        type Key = String;
         fn cache_id(&self) -> u32 { self.id }
         fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
         fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
@@ -340,6 +413,7 @@ fn doc_example() {
 struct MultiQuery { id: u32, _val: u32, _query: String }
 impl ImcCacheable for MultiQuery {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 100 }
@@ -369,6 +443,7 @@ fn test_multi_arg_tuple() {
 struct SizedWidget { id: u32, data: String }
 impl ImcCacheable for SizedWidget {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 100 }
@@ -433,6 +508,7 @@ fn test_value_size_over_limit_skips_cache() {
 struct VecItem { id: u32, name: String }
 impl ImcCacheable for VecItem {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 100 }
@@ -486,6 +562,7 @@ macro_rules! worker_strat_def {
         struct $name { id: u32, _val: u32 }
         impl ImcCacheable for $name {
             type Id = u32;
+            type Key = String;
             fn cache_id(&self) -> u32 { self.id }
             fn cache_strategy() -> CacheStrategy { $strategy }
             fn cache_max_size() -> usize { 3 }
@@ -607,6 +684,7 @@ struct InvalWidget { id: u32, name: String }
 
 impl ImcCacheable for InvalWidget {
     type Id = u32;
+    type Key = String;
     fn cache_id(&self) -> u32 { self.id }
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
     fn cache_max_size() -> usize { 100 }

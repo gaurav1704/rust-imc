@@ -18,6 +18,20 @@ use crate::traits::ImcCacheable;
 /// duplicate is created** – the existing copy is kept and the freshly
 /// computed value is discarded.
 ///
+/// # Free-form args
+///
+/// The `args` parameter is a free generic — any `Hash + Clone + Send + 'static`
+/// type works.  This gives maximum flexibility but permits accidental cache-key
+/// collisions from typos or inconsistent call sites.
+///
+/// ```ignore
+/// through_imc(42u32, || …);                     // single id
+/// through_imc(("gt", 10, "india"), || …);       // tuple of conditions
+/// through_imc("select * from …", || …);         // raw SQL string
+/// ```
+///
+/// For strict, compiler-enforced keys see [`through_imc_keyed`].
+///
 /// # Example
 ///
 /// ```
@@ -29,6 +43,7 @@ use crate::traits::ImcCacheable;
 ///
 /// impl ImcCacheable for User {
 ///     type Id = u32;
+///     type Key = String;
 ///     fn cache_id(&self) -> u32 { self.id }
 ///     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
 ///     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
@@ -87,6 +102,74 @@ where
         .expect("value was just stored")
 }
 
+/// Typed-key variant of [`through_imc`].
+///
+/// Instead of a free-form generic `A`, the key is obtained from the type's
+/// [`ImcCacheable::Key`] associated type.  Override `Key` with a closed enum
+/// to make invalid cache keys a compile-time error.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Hash, Clone)]
+/// enum UserKey { ById(i32), ByEmail(String) }
+///
+/// impl ImcCacheable for User {
+///     type Id = i32;
+///     type Key = UserKey;
+///     // …
+/// }
+///
+/// through_imc_keyed(UserKey::ById(42), || fetch_user(42));          // ✓
+/// through_imc_keyed(UserKey::ByEmail("a@b".into()), || …);          // ✓
+/// // through_imc_keyed("anything", || …);                           // ✗ compile error
+/// ```
+pub fn through_imc_keyed<T, F>(key: T::Key, f: F) -> T
+where
+    T: ImcCacheable,
+    F: FnOnce() -> T,
+{
+    let type_id = TypeId::of::<T>();
+    let args_hash = hash_value(&key);
+
+    {
+        let stores = global().stores.read().unwrap();
+        if let Some(cache) = stores.get(&type_id) {
+            if let Some(value) = cache.get::<T>(args_hash) {
+                crate::metrics::record_hit();
+                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
+                return value;
+            }
+        }
+    }
+
+    crate::metrics::record_miss();
+    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
+
+    let value = f();
+    let id = value.cache_id();
+    let id_hash = hash_value(&id);
+    let ttl = T::cache_ttl();
+
+    if let Some(vsize) = value.cache_value_size() {
+        if vsize > T::cache_max_value_size() {
+            crate::log_event!(WARN, crate::log::API, crate::log::SET,
+                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
+            return value;
+        }
+    }
+
+    let mut stores = global().stores.write().unwrap();
+    let cache = stores
+        .entry(type_id)
+        .or_insert_with(|| PerTypeCache::from_trait::<T>());
+    cache.set::<T>(args_hash, id_hash, value, ttl);
+
+    cache
+        .get::<T>(args_hash)
+        .expect("value was just stored")
+}
+
 /// Async version of [`through_imc`].
 ///
 /// Requires the `async` or `tokio` feature.
@@ -100,6 +183,57 @@ where
 {
     let type_id = TypeId::of::<T>();
     let args_hash = hash_value(&args);
+
+    {
+        let stores = global().stores.read().unwrap();
+        if let Some(cache) = stores.get(&type_id) {
+            if let Some(value) = cache.get::<T>(args_hash) {
+                crate::metrics::record_hit();
+                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
+                return value;
+            }
+        }
+    }
+
+    crate::metrics::record_miss();
+    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
+
+    let value = f().await;
+    let id = value.cache_id();
+    let id_hash = hash_value(&id);
+    let ttl = T::cache_ttl();
+
+    if let Some(vsize) = value.cache_value_size() {
+        if vsize > T::cache_max_value_size() {
+            crate::log_event!(WARN, crate::log::API, crate::log::SET,
+                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
+            return value;
+        }
+    }
+
+    let mut stores = global().stores.write().unwrap();
+    let cache = stores
+        .entry(type_id)
+        .or_insert_with(|| PerTypeCache::from_trait::<T>());
+    cache.set::<T>(args_hash, id_hash, value, ttl);
+
+    cache
+        .get::<T>(args_hash)
+        .expect("value was just stored")
+}
+
+/// Typed-key variant of [`through_imc_async`].
+///
+/// See [`through_imc_keyed`] for details — this is the async equivalent.
+#[cfg(any(feature = "async", feature = "tokio"))]
+pub async fn through_imc_keyed_async<T, F, Fut>(key: T::Key, f: F) -> T
+where
+    T: ImcCacheable,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let type_id = TypeId::of::<T>();
+    let args_hash = hash_value(&key);
 
     {
         let stores = global().stores.read().unwrap();
