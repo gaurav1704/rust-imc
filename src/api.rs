@@ -34,11 +34,9 @@ use crate::traits::ImcCacheable;
 ///     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
 /// }
 ///
-/// // Simulate fetching by user-id …
 /// let u: User = through_imc(42u32, || User { id: 42, name: "Alice".into() });
 /// assert_eq!(u.name, "Alice");
 ///
-/// // … and by email.  Both queries return the *same* backing `User` object.
 /// let u2: User = through_imc("alice@example.com", || User { id: 42, name: "Alice".into() });
 /// assert_eq!(u2.name, "Alice");
 /// ```
@@ -51,30 +49,31 @@ where
     let type_id = TypeId::of::<T>();
     let args_hash = hash_value(&args);
 
-    // Fast path: read-lock check
     {
         let stores = global().stores.read().unwrap();
         if let Some(cache) = stores.get(&type_id) {
             if let Some(value) = cache.get::<T>(args_hash) {
+                crate::metrics::record_hit();
+                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
                 return value;
             }
         }
     }
 
-    // Miss – compute the value
+    crate::metrics::record_miss();
+    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
+
     let value = f();
     let id = value.cache_id();
     let id_hash = hash_value(&id);
     let ttl = T::cache_ttl();
 
-    // Write-lock to store (deduplicates internally)
     let mut stores = global().stores.write().unwrap();
     let cache = stores
         .entry(type_id)
         .or_insert_with(|| PerTypeCache::from_trait::<T>());
     cache.set::<T>(args_hash, id_hash, value, ttl);
 
-    // Re-read to return the canonical copy (in case dedup kicked in)
     cache
         .get::<T>(args_hash)
         .expect("value was just stored")
@@ -98,10 +97,15 @@ where
         let stores = global().stores.read().unwrap();
         if let Some(cache) = stores.get(&type_id) {
             if let Some(value) = cache.get::<T>(args_hash) {
+                crate::metrics::record_hit();
+                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
                 return value;
             }
         }
     }
+
+    crate::metrics::record_miss();
+    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
 
     let value = f().await;
     let id = value.cache_id();
@@ -120,9 +124,6 @@ where
 }
 
 /// Remove a single entry (by its unique [`Id`](ImcCacheable::Id)).
-///
-/// Stale index entries are *not* eagerly cleaned up; they will resolve to a
-/// miss on the next access and be overwritten.
 pub fn imc_remove<T: ImcCacheable>(id: &T::Id) {
     let type_id = TypeId::of::<T>();
     let id_hash = hash_value(id);
@@ -130,6 +131,7 @@ pub fn imc_remove<T: ImcCacheable>(id: &T::Id) {
     let mut stores = global().stores.write().unwrap();
     if let Some(cache) = stores.get_mut(&type_id) {
         cache.remove_data(id_hash);
+        crate::log_event!(DEBUG, crate::log::API, crate::log::REMOVE, type_id = ?type_id, id_hash = id_hash);
     }
 }
 
@@ -140,6 +142,7 @@ pub fn imc_clear<T: ImcCacheable>() {
     let mut stores = global().stores.write().unwrap();
     if let Some(cache) = stores.get_mut(&type_id) {
         cache.clear();
+        crate::log_event!(INFO, crate::log::API, crate::log::CLEAR, type_id = ?type_id);
     }
 }
 
@@ -148,7 +151,9 @@ pub fn imc_len<T: ImcCacheable>() -> usize {
     let type_id = TypeId::of::<T>();
 
     let stores = global().stores.read().unwrap();
-    stores.get(&type_id).map_or(0, |c| c.len())
+    let len = stores.get(&type_id).map_or(0, |c| c.len());
+    crate::metrics::set_entries(len);
+    len
 }
 
 /// Compute the stable hash string that other pods must publish to
@@ -161,7 +166,6 @@ pub fn imc_len<T: ImcCacheable>() -> usize {
 ///
 /// ```ignore
 /// let inval_id = imc_invalidation_id::<User>(&42);
-/// // publish `inval_id` on User's channel when User 42 is mutated
 /// redis_publish("users", inval_id);
 /// ```
 pub fn imc_invalidation_id<T: ImcCacheable>(id: &T::Id) -> String {

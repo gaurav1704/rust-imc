@@ -13,7 +13,6 @@ use crate::traits::ImcCacheable;
 // Background worker command
 // ---------------------------------------------------------------------------
 
-/// Commands that can be sent to the background maintenance worker.
 pub(crate) enum CacheCmd {
     Remove(TypeId, u64),
     Clear(TypeId),
@@ -30,8 +29,6 @@ type WorkerJoinHandle = JoinHandle<()>;
 #[cfg(feature = "tokio")]
 type WorkerJoinHandle = tokio::task::JoinHandle<()>;
 
-/// Spawn a long-lived background thread (or tokio blocking-task when the
-/// `tokio` feature is active).
 #[cfg(not(feature = "tokio"))]
 fn spawn_worker_thread(name: &'static str, f: impl FnOnce() + Send + 'static) -> WorkerJoinHandle {
     std::thread::Builder::new()
@@ -48,7 +45,6 @@ fn spawn_worker_thread(_name: &'static str, f: impl FnOnce() + Send + 'static) -
 // Global worker-active marker
 // ---------------------------------------------------------------------------
 
-/// Global sender that signals whether a background worker is active.
 pub(crate) static WORKER_TX: Mutex<Option<Sender<CacheCmd>>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
@@ -60,6 +56,10 @@ pub(crate) static WORKER_TX: Mutex<Option<Sender<CacheCmd>>> = Mutex::new(None);
 pub struct WorkerConfig {
     /// How often the background thread sweeps for expired & excess entries.
     pub sweep_interval: Duration,
+    /// Optional Prometheus Push Gateway URL for metric export.
+    /// Requires the `metrics-prometheus` feature.
+    #[cfg(feature = "metrics-prometheus")]
+    pub prometheus_push_gateway: Option<String>,
     /// Optional Redis connection string for cross-process cache invalidation
     /// via pub/sub. Requires the `invalidation-redis` feature.
     #[cfg(feature = "invalidation-redis")]
@@ -70,6 +70,8 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             sweep_interval: Duration::from_secs(10),
+            #[cfg(feature = "metrics-prometheus")]
+            prometheus_push_gateway: None,
             #[cfg(feature = "invalidation-redis")]
             redis_connection_string: None,
         }
@@ -117,6 +119,8 @@ impl CacheWorker {
 
         let cfg_for_loop = WorkerConfig {
             sweep_interval: config.sweep_interval,
+            #[cfg(feature = "metrics-prometheus")]
+            prometheus_push_gateway: config.prometheus_push_gateway.clone(),
             #[cfg(feature = "invalidation-redis")]
             redis_connection_string: config.redis_connection_string.clone(),
         };
@@ -137,6 +141,9 @@ impl CacheWorker {
         } else {
             None
         };
+
+        crate::log_event!(INFO, crate::log::WORKER, crate::log::START,
+            sweep_interval = ?config.sweep_interval);
 
         Self {
             tx,
@@ -167,10 +174,9 @@ impl CacheWorker {
 
 impl Drop for CacheWorker {
     fn drop(&mut self) {
-        // Clear the global marker so inline eviction resumes.
         *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // Signal shutdown so the background thread joins promptly.
         let _ = self.tx.send(CacheCmd::Shutdown);
+        crate::log_event!(INFO, crate::log::WORKER, crate::log::STOP);
     }
 }
 
@@ -180,6 +186,16 @@ impl Drop for CacheWorker {
 
 pub(crate) fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
     let sweep_interval = config.sweep_interval;
+    let push_gateway = {
+        #[cfg(feature = "metrics-prometheus")]
+        {
+            config.prometheus_push_gateway.clone()
+        }
+        #[cfg(not(feature = "metrics-prometheus"))]
+        {
+            None::<String>
+        }
+    };
 
     loop {
         match rx.recv_timeout(sweep_interval) {
@@ -188,25 +204,41 @@ pub(crate) fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
                     let mut stores = global().stores.write().unwrap();
                     if let Some(cache) = stores.get_mut(&type_id) {
                         cache.remove_data(id_hash);
+                        crate::log_event!(DEBUG, crate::log::WORKER, crate::log::REMOVE,
+                            type_id = ?type_id, id_hash = id_hash);
                     }
                 }
                 CacheCmd::Clear(type_id) => {
                     let mut stores = global().stores.write().unwrap();
                     if let Some(cache) = stores.get_mut(&type_id) {
                         cache.clear();
+                        crate::log_event!(INFO, crate::log::WORKER, crate::log::CLEAR,
+                            type_id = ?type_id);
                     }
                 }
                 CacheCmd::ClearAll => {
                     let mut stores = global().stores.write().unwrap();
                     stores.clear();
+                    crate::log_event!(INFO, crate::log::WORKER, crate::log::CLEAR, all = true);
                 }
-                CacheCmd::Shutdown => return,
+                CacheCmd::Shutdown => {
+                    crate::log_event!(INFO, crate::log::WORKER, crate::log::STOP, reason = "shutdown");
+                    return;
+                }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
         sweep_all();
+
+        #[allow(unused_variables)]
+        if let Some(ref url) = push_gateway {
+            if let Err(e) = crate::metrics::push(url) {
+                crate::log_event!(WARN, crate::log::WORKER, crate::log::ERROR,
+                    "failed to push metrics: {}", e);
+            }
+        }
     }
 }
 
@@ -221,6 +253,7 @@ pub(crate) fn sweep_all() {
         if let Some(cache) = stores.get_mut(&type_id) {
             cache.remove_expired();
             cache.evict_to_max_size();
+            crate::metrics::set_entries(cache.len());
         }
     }
 }

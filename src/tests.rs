@@ -360,8 +360,7 @@ fn test_worker_skips_inline_eviction() {
 
     let _worker = CacheWorker::spawn_with_config(WorkerConfig {
         sweep_interval: Duration::from_secs(1),
-        #[cfg(feature = "invalidation-redis")]
-        redis_connection_string: None,
+        ..Default::default()
     });
 
     fetch::<WkrLru, _>(1u32, || WkrLru { id: 1, _val: 10 });
@@ -380,8 +379,7 @@ fn test_worker_eviction_sweep() {
 
     let worker = CacheWorker::spawn_with_config(WorkerConfig {
         sweep_interval: Duration::from_secs(1),
-        #[cfg(feature = "invalidation-redis")]
-        redis_connection_string: None,
+        ..Default::default()
     });
 
     fetch::<WkrFifo, _>(1u32, || WkrFifo { id: 1, _val: 10 });
@@ -409,8 +407,7 @@ fn test_worker_inline_eviction_resumes_after_drop() {
 
     let worker = CacheWorker::spawn_with_config(WorkerConfig {
         sweep_interval: Duration::from_secs(1),
-        #[cfg(feature = "invalidation-redis")]
-        redis_connection_string: None,
+        ..Default::default()
     });
 
     fetch::<WkrFifo, _>(10u32, || WkrFifo { id: 10, _val: 100 });
@@ -436,8 +433,7 @@ fn test_worker_remove_via_command() {
 
     let worker = CacheWorker::spawn_with_config(WorkerConfig {
         sweep_interval: Duration::from_secs(1),
-        #[cfg(feature = "invalidation-redis")]
-        redis_connection_string: None,
+        ..Default::default()
     });
 
     fetch::<WkrLru, _>(1u32, || WkrLru { id: 1, _val: 10 });

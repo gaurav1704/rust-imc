@@ -4,6 +4,8 @@ mod entry;
 mod cache;
 pub(crate) mod worker;
 mod api;
+pub(crate) mod log;
+pub(crate) mod metrics;
 
 #[cfg(feature = "invalidation-redis")]
 pub(crate) mod invalidation;

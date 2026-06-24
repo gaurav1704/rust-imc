@@ -32,23 +32,30 @@ pub(crate) fn snapshot_channels() -> Vec<(String, TypeId)> {
 }
 
 pub(crate) fn redis_subscriber_loop(redis_url: &str, channels: Vec<(String, TypeId)>) {
+    crate::log_event!(INFO, crate::log::INVALIDATION, crate::log::START,
+        redis_url = redis_url, channel_count = channels.len());
+
     let chan_map: HashMap<String, TypeId> = channels.into_iter().collect();
     let client = match redis::Client::open(redis_url) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("imc: failed to connect to Redis: {e}");
+            crate::log_event!(ERROR, crate::log::INVALIDATION, crate::log::ERROR,
+                "failed to connect to Redis: {}", e);
             return;
         }
     };
 
     loop {
         if WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            crate::log_event!(INFO, crate::log::INVALIDATION, crate::log::STOP,
+                reason = "worker gone");
             break;
         }
         match run_subscriber(&client, &chan_map) {
             Ok(()) => break,
             Err(e) => {
-                eprintln!("imc: Redis subscriber error: {e}, reconnecting in 5s");
+                crate::log_event!(WARN, crate::log::INVALIDATION, crate::log::ERROR,
+                    "Redis subscriber error: {}, reconnecting in 5s", e);
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
@@ -65,6 +72,8 @@ fn run_subscriber(
 
     for channel in chan_map.keys() {
         pubsub.subscribe(channel.as_str())?;
+        crate::log_event!(DEBUG, crate::log::INVALIDATION, crate::log::START,
+            "subscribed to channel '{}'", channel);
     }
 
     loop {
@@ -76,6 +85,9 @@ fn run_subscriber(
             Ok(msg) => {
                 let channel = msg.get_channel_name();
                 let payload: String = msg.get_payload()?;
+
+                crate::log_event!(DEBUG, crate::log::INVALIDATION, crate::log::REMOVE,
+                    channel = channel, payload = &payload);
 
                 if let Ok(id_hash) = payload.parse::<u64>() {
                     if let Some(&type_id) = chan_map.get(channel) {
