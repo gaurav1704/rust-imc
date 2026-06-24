@@ -172,22 +172,128 @@ let u2: User = through_imc("alice@example.com", || fetch_user_by_email("alice"))
 assert_eq!(u.id, u2.id);
 ```
 
-### With background worker + Redis invalidation
+---
+
+## Examples
+
+### Diesel / PostgreSQL
+
+Wrap Diesel queries with `through_imc` — deduplication across primary-key and alternate-key lookups works automatically.
+
+```rust
+use diesel::prelude::*;
+use imc::{CacheStrategy, ImcCacheable, through_imc};
+use std::time::Duration;
+
+// ── 1.  Model (must be Clone) ──────────────────────────────────────────
+#[derive(Queryable, Identifiable, Clone, Debug, PartialEq)]
+#[diesel(table_name = users)]
+pub struct User {
+    pub id: i32,
+    pub name: String,
+    pub email: String,
+}
+
+// ── 2.  Cache configuration ────────────────────────────────────────────
+impl ImcCacheable for User {
+    type Id = i32;
+
+    fn cache_id(&self) -> i32 { self.id }
+
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+
+    fn cache_ttl() -> Option<Duration> {
+        Some(Duration::from_secs(300))  // 5 minutes
+    }
+
+    fn cache_max_size() -> usize { 10_000 }
+}
+
+// ── 3.  Query helpers ──────────────────────────────────────────────────
+fn get_user_by_id(conn: &mut PgConnection, id: i32) -> QueryResult<User> {
+    // First call runs Diesel; second call with same id returns cached.
+    Ok(through_imc(id, || users::table.find(id).first::<User>(conn)))
+}
+
+fn get_user_by_email(conn: &mut PgConnection, email: &str) -> QueryResult<User> {
+    Ok(through_imc(email.to_string(), || {
+        users::table.filter(users::email.eq(email)).first::<User>(conn)
+    }))
+}
+
+// get_user_by_id(42) and get_user_by_email("alice@example.com") both
+// resolve to User { id: 42, ... }.  The second call returns the
+// cached copy — Diesel never runs.
+```
+
+Key points:
+- The model must derive (or manually implement) `Clone`.
+- The closure borrows `conn` — imc releases the read lock before running it, so there is no deadlock.
+- Use `through_imc_async` with `diesel_async` when using async Diesel.
+
+### Redis cross-process invalidation
+
+Invalidate cached entries across multiple application pods when data is mutated in one of them.
 
 ```toml
 [dependencies]
 imc = { git = "https://github.com/gaurav1704/rust-imc", features = ["invalidation-redis"] }
+redis = "0.27"
 ```
 
 ```rust
-use imc::{CacheWorker, WorkerConfig};
+use imc::{CacheStrategy, ImcCacheable, CacheWorker, WorkerConfig, imc_invalidation_id};
+use std::time::Duration;
 
-// Spawn once at startup
+// ── 1.  Model with invalidation channel ────────────────────────────────
+#[derive(Clone)]
+pub struct User {
+    pub id: i32,
+    pub name: String,
+    pub email: String,
+}
+
+impl ImcCacheable for User {
+    type Id = i32;
+
+    fn cache_id(&self) -> i32 { self.id }
+
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+
+    fn cache_ttl() -> Option<Duration> {
+        Some(Duration::from_secs(300))
+    }
+
+    fn cache_max_size() -> usize { 10_000 }
+
+    // All pods that cache User subscribe to this channel.
+    fn cache_invalidation_channel() -> Option<&'static str> {
+        Some("users")
+    }
+}
+
+// ── 2.  Spawn worker + Redis subscriber on every pod ───────────────────
 let _worker = CacheWorker::spawn_with_config(WorkerConfig {
     sweep_interval: Duration::from_secs(10),
     redis_connection_string: Some("redis://localhost:6379".into()),
 });
 
-// On data mutation, publish the stable hash:
-redis_publish("user_channel", imc_invalidation_id::<User>(&42)).await;
+// ── 3.  On mutation, publish the stable hash to invalidate ─────────────
+// (runs in the pod that performed the INSERT/UPDATE/DELETE)
+fn publish_invalidation(user_id: i32) {
+    let client = redis::Client::open("redis://localhost:6379").unwrap();
+    let mut conn = client.get_connection().unwrap();
+    let hash: String = imc_invalidation_id::<User>(&user_id);
+    let _: () = redis::Cmd::publish("users", hash).query(&mut conn).unwrap();
+}
+
+// After publish_invalidation(42), every pod that subscribes to the
+// "users" channel removes User { id: 42 } from its local cache.
+// The next read re-fetches from the database.
 ```
+
+Key points:
+- Every pod runs the subscriber (via `CacheWorker::spawn_with_config` with a `redis_connection_string`).
+- Only the mutating pod needs to call `publish_invalidation` — imc does not auto-publish.
+- The hash is computed with the same FNV-1a `StableHasher` on every pod, so all pods agree on which entry to remove.
+- Subscribers automatically reconnect on error with a 5-second backoff.
