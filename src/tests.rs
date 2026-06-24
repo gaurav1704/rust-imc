@@ -333,6 +333,150 @@ fn doc_example() {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-arg tests
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+struct MultiQuery { id: u32, _val: u32, _query: String }
+impl ImcCacheable for MultiQuery {
+    type Id = u32;
+    fn cache_id(&self) -> u32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_max_size() -> usize { 100 }
+    fn cache_ttl() -> Option<Duration> { None }
+}
+
+#[test]
+fn test_multi_arg_tuple() {
+    let r1: MultiQuery = through_imc((10u32, "india".to_string()), || {
+        MultiQuery { id: 1, _val: 100, _query: "age > 10, region = india".into() }
+    });
+    assert_eq!(r1._val, 100);
+
+    let r2: MultiQuery = through_imc((20u32, "usa".to_string()), || {
+        MultiQuery { id: 2, _val: 200, _query: "age > 20, region = usa".into() }
+    });
+    assert_eq!(r2._val, 200);
+
+    assert_eq!(imc_len::<MultiQuery>(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Value size limit tests
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+struct SizedWidget { id: u32, data: String }
+impl ImcCacheable for SizedWidget {
+    type Id = u32;
+    fn cache_id(&self) -> u32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_max_size() -> usize { 100 }
+    fn cache_ttl() -> Option<Duration> { None }
+    fn cache_value_size(&self) -> Option<usize> {
+        Some(std::mem::size_of::<u32>() + self.data.len())
+    }
+    fn cache_max_value_size() -> usize { 50 }
+}
+
+#[test]
+#[serial]
+fn test_value_size_under_limit_is_cached() {
+    imc_clear::<SizedWidget>();
+    let call_count = AtomicU32::new(0);
+
+    let r1: SizedWidget = fetch(1u32, || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        SizedWidget { id: 1, data: "small".into() }
+    });
+    assert_eq!(r1.data, "small");
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+
+    let r2: SizedWidget = fetch(1u32, || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        SizedWidget { id: 1, data: "small".into() }
+    });
+    assert_eq!(r2.data, "small");
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+#[serial]
+fn test_value_size_over_limit_skips_cache() {
+    imc_clear::<SizedWidget>();
+    let call_count = AtomicU32::new(0);
+
+    let large_data = "x".repeat(100);
+
+    let r1: SizedWidget = fetch(42u32, || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        SizedWidget { id: 42, data: large_data.clone() }
+    });
+    assert_eq!(r1.data.len(), 100);
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(imc_len::<SizedWidget>(), 0);
+
+    let r2: SizedWidget = fetch(42u32, || {
+        call_count.fetch_add(1, AtomicOrdering::SeqCst);
+        SizedWidget { id: 42, data: large_data.clone() }
+    });
+    assert_eq!(r2.data.len(), 100);
+    assert_eq!(call_count.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(imc_len::<SizedWidget>(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Vec caching tests
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+struct VecItem { id: u32, name: String }
+impl ImcCacheable for VecItem {
+    type Id = u32;
+    fn cache_id(&self) -> u32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_max_size() -> usize { 100 }
+    fn cache_ttl() -> Option<Duration> { None }
+}
+
+#[test]
+#[serial]
+fn test_vec_of_cacheable_objects() {
+    imc_clear::<Vec<VecItem>>();
+    let r1: Vec<VecItem> = through_imc("query_a", || {
+        vec![
+            VecItem { id: 1, name: "Alice".into() },
+            VecItem { id: 2, name: "Bob".into() },
+        ]
+    });
+    assert_eq!(r1.len(), 2);
+
+    let r2: Vec<VecItem> = through_imc("query_a", || {
+        vec![VecItem { id: 99, name: "WRONG".into() }]
+    });
+    assert_eq!(r2.len(), 2);
+    assert_eq!(r2[0].name, "Alice");
+}
+
+#[test]
+#[serial]
+fn test_vec_dedup_same_ids_different_queries() {
+    imc_clear::<Vec<VecItem>>();
+    let r1: Vec<VecItem> = through_imc(1u32, || {
+        vec![
+            VecItem { id: 10, name: "Ten".into() },
+        ]
+    });
+    assert_eq!(r1[0].name, "Ten");
+
+    let r2: Vec<VecItem> = through_imc("by_id_10", || {
+        vec![VecItem { id: 10, name: "WRONG".into() }]
+    });
+    assert_eq!(r2[0].name, "Ten");
+    assert_eq!(imc_len::<Vec<VecItem>>(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Worker tests
 // ---------------------------------------------------------------------------
 

@@ -62,6 +62,16 @@ Evicts the entry that was inserted earliest (`inserted_at`). Ignores access patt
 - **Values:** Any `usize`. Default: `10_000`.
 - **Behaviour:** When the namespace is at capacity and a new entry arrives, the eviction strategy selects one entry to remove. Inline eviction fires on every `set()`; when a `CacheWorker` is active, inline eviction is deferred to the periodic background sweep.
 
+### `cache_value_size()`
+- **Purpose:** Report the approximate byte-size of a value for the per-value size limit.
+- **Values:** `Some(usize)` or `None` (unknown — skip size check, always cache). Default: `None`.
+- **Behaviour:** When this returns a size and it exceeds [`cache_max_value_size()`](#cache_max_value_size), the value bypasses the cache entirely (returned directly to the caller without storing).
+
+### `cache_max_value_size()`
+- **Purpose:** Maximum byte-size of a single cached value.
+- **Values:** Any `usize`. Default: `1_048_576` (1 MiB).
+- **Behaviour:** Only takes effect when [`cache_value_size()`](#cache_value_size) is implemented and returns `Some(size)`. Values larger than this limit are not cached — the closure runs every time.
+
 ### `cache_invalidation_channel()`
 - **Purpose:** Enable cross-process cache invalidation via pub/sub.
 - **Values:** `Some("channel_name")` or `None` (disabled).

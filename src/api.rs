@@ -68,6 +68,14 @@ where
     let id_hash = hash_value(&id);
     let ttl = T::cache_ttl();
 
+    if let Some(vsize) = value.cache_value_size() {
+        if vsize > T::cache_max_value_size() {
+            crate::log_event!(WARN, crate::log::API, crate::log::SET,
+                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
+            return value;
+        }
+    }
+
     let mut stores = global().stores.write().unwrap();
     let cache = stores
         .entry(type_id)
@@ -111,6 +119,14 @@ where
     let id = value.cache_id();
     let id_hash = hash_value(&id);
     let ttl = T::cache_ttl();
+
+    if let Some(vsize) = value.cache_value_size() {
+        if vsize > T::cache_max_value_size() {
+            crate::log_event!(WARN, crate::log::API, crate::log::SET,
+                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
+            return value;
+        }
+    }
 
     let mut stores = global().stores.write().unwrap();
     let cache = stores
