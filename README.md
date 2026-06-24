@@ -18,6 +18,8 @@ assert_eq!(user.id, same.id); // same backing entry
 | `async` | no | Enables `through_imc_async` for async closure support (runtime-agnostic) |
 | `tokio` | no | Implies `async` + makes `CacheWorker` use `tokio::task::spawn_blocking` instead of `std::thread` |
 | `invalidation-redis` | no | Cross-process cache invalidation via Redis pub/sub (optional `redis` crate dep) |
+| `logging` | no | Structured tracing events via `log_event!` macro (uses `tracing`). Format controlled by your app's subscriber |
+| `metrics-prometheus` | no | Prometheus metrics (hits, misses, sets, evictions, entries) pushed to a Push Gateway via `metrics::push()` |
 
 ---
 
