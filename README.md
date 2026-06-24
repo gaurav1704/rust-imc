@@ -111,6 +111,39 @@ flowchart TD
 
 ---
 
+## Lifecycle
+
+The global cache store is lazily initialised on first use, but you can make
+the lifecycle explicit at startup:
+
+```rust
+use imc::Imc;
+
+// Option A — just ensure the store exists (no background worker):
+Imc::init();
+
+// Option B — init + spawn a background maintenance worker:
+let _worker = Imc::start(Default::default());
+// worker runs while _worker is alive; drop it to shut down.
+```
+
+Calling `Imc::start` is equivalent to `Imc::init()` + `CacheWorker::spawn()`.
+
+## Module Structure
+
+```
+src/
+├── lib.rs         — Public re-exports, lifecycle (Imc::init / Imc::start)
+├── traits.rs      — ImcCacheable trait, CacheStrategy enum
+├── hasher.rs      — StableHasher (FNV-1a), hash_value(), tick()
+├── entry.rs       — Entry struct with access metadata
+├── cache.rs       — PerTypeCache, GlobalCache, global()
+├── worker.rs      — CacheCmd, CacheWorker, worker_loop, sweep_all
+├── api.rs         — through_imc, through_imc_async, imc_remove, etc.
+├── invalidation.rs— Redis pub/sub subscriber (behind invalidation-redis)
+└── tests.rs       — Unit tests (>30 across all features)
+```
+
 ## Quick Start
 
 ```toml
