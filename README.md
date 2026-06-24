@@ -422,21 +422,24 @@ fn get_users_by_age_and_region(age: i32, region: &str) -> User {
     })
 }
 
-// ── 3.  Result set (Vec) with the same conditions ──────────────────────
+// ── 3.  Result set (Vec) with operator-aware conditions ────────────────
+// The comparison operator is part of the cache key — `age > 10` and
+// `age < 10` produce different tuples and never collide.
 // Vec<User> implements ImcCacheable automatically — cache_id() hashes
 // all element IDs together.  Two different queries that return the same
 // logical set of users share one cached Vec.
-fn get_all_users_by_age_and_region(age: i32, region: &str) -> Vec<User> {
-    through_imc(("list", age, region.to_string()), || {
+fn get_all_users_by_age_and_region(op: &str, age: i32, region: &str) -> Vec<User> {
+    through_imc(("list", op.to_string(), age, region.to_string()), || {
         // e.g. SELECT * FROM users WHERE age > $1 AND region = $2
-        fetch_users_raw(age, region)
+        //     op = "gt" or "lt" or "gte" …
+        fetch_users_raw(op, age, region)
     })
 }
 
 // ── 4.  Mix and match ──────────────────────────────────────────────────
 // Tuples with different shapes are distinct cache keys:
 let _ = get_users_by_age_and_region(10, "india");     // key: (10, "india")
-let _ = get_all_users_by_age_and_region(10, "india"); // key: ("list", 10, "india") → different namespace
+let _ = get_all_users_by_age_and_region("gt", 10, "india"); // key: ("list", "gt", 10, "india")
 ```
 
 Any tuple of `Hash + Clone + Send + 'static` values works as the cache key: `(i32, String)`, `(bool, u64, String)`, etc. The `Vec<T>` blanket means you never need a wrapper type for result sets.
