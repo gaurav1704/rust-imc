@@ -114,8 +114,72 @@ flowchart TD
         AB --> AC["parse hash →<br/>remove_data(type_id, hash)"]
     end
 
+    subgraph PD["Prometheus Metrics (feature: metrics-prometheus)"]
+        PE["metrics::record_hit / record_miss /<br/>record_set / record_eviction / record_expired<br/>set_entries"] --> PF["Local counters & gauges"]
+        PF --> PG["metrics::push(gateway_url)"]
+        PG --> PH["Prometheus Push Gateway"]
+    end
+
+    B -.->|"on hit"| PE
+    D -.->|"on miss"| PE
+    G -.->|"on set/evict/expiry"| PE
+    O -.->|"after sweep"| PG
+
     O -.->|"Deferred eviction"| G
     X -.->|"On mutation"| O
+```
+
+---
+
+## Prometheus Metrics
+
+When the `metrics-prometheus` feature is enabled, imc maintains a set of counters and a gauge that track cache behaviour. These are pushed to a Prometheus Push Gateway from the background worker loop after each sweep.
+
+### Configuration
+
+Set `prometheus_push_gateway` in `WorkerConfig` to point at your Push Gateway:
+
+```rust
+let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+    sweep_interval: Duration::from_secs(10),
+    prometheus_push_gateway: Some("http://pushgateway:9091".into()),
+    ..Default::default()
+});
+```
+
+Metrics are pushed once per sweep cycle (every `sweep_interval`).
+
+### Metric Reference
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `imc_cache_hits_total` | Counter | — | Total number of cache lookups that returned a cached value. Incremented on every successful `get()` in `PerTypeCache`. |
+| `imc_cache_misses_total` | Counter | — | Total number of cache lookups that returned no value (miss or TTL expiry). Incremented when `get()` returns `None`. |
+| `imc_cache_sets_total` | Counter | — | Total number of cache insertions (new entries and dedups). Incremented in `PerTypeCache::set()`. |
+| `imc_cache_evictions_total` | Counter | — | Total number of entries evicted to stay within `cache_max_size()`. Incremented on inline eviction (`set()`) and background sweep eviction (`evict_to_max_size()`). |
+| `imc_cache_expired_total` | Counter | — | Total number of TTL-expired entries removed. Incremented in `remove_expired()` and `clear()`. |
+| `imc_cache_entries` | Gauge | — | Current number of unique entries across all cached types. Updated on every `imc_len()` call and after each sweep. |
+
+### Consuming Metrics
+
+Point Prometheus to scrape the Push Gateway:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'imc'
+    static_configs:
+      - targets: ['pushgateway:9091']
+```
+
+Or use any Prometheus Push Gateway compatible system (e.g. Grafana Cloud, VictoriaMetrics).
+
+### Manual Push
+
+You can also push metrics ad-hoc from application code:
+
+```rust
+imc::metrics::push("http://pushgateway:9091").unwrap();
 ```
 
 ---
