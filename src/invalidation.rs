@@ -38,9 +38,9 @@ pub(crate) fn redis_subscriber_loop(redis_url: &str, channels: Vec<(String, Type
     let chan_map: HashMap<String, TypeId> = channels.into_iter().collect();
     let client = match redis::Client::open(redis_url) {
         Ok(c) => c,
-        Err(e) => {
+        Err(_e) => {
             crate::log_event!(ERROR, crate::log::INVALIDATION, crate::log::ERROR,
-                "failed to connect to Redis: {}", e);
+                "failed to connect to Redis: {}", _e);
             return;
         }
     };
@@ -53,9 +53,9 @@ pub(crate) fn redis_subscriber_loop(redis_url: &str, channels: Vec<(String, Type
         }
         match run_subscriber(&client, &chan_map) {
             Ok(()) => break,
-            Err(e) => {
+            Err(_err) => {
                 crate::log_event!(WARN, crate::log::INVALIDATION, crate::log::ERROR,
-                    "Redis subscriber error: {}, reconnecting in 5s", e);
+                    "Redis subscriber error: {}, reconnecting in 5s", _err);
                 std::thread::sleep(Duration::from_secs(5));
             }
         }

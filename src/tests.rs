@@ -715,3 +715,61 @@ fn test_invalidation_registry() {
     let channels = crate::invalidation::snapshot_channels();
     assert!(channels.iter().any(|(c, _)| c == "inval_widget"));
 }
+
+// ---------------------------------------------------------------------------
+// Critical-key tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "critical")]
+mod critical_tests {
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+    use std::time::Duration;
+
+    use imc_derive::CriticalKey;
+    use crate::CriticalKey;
+    use crate::*;
+
+    #[derive(Hash, Clone, Debug, PartialEq, CriticalKey)]
+    #[allow(dead_code)]
+    enum CritUserKey { ById(u32), ByEmail(String) }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CritUser { id: u32, name: String }
+    impl ImcCacheable for CritUser {
+        type Id = u32;
+        type Key = CritUserKey;
+        fn cache_id(&self) -> u32 { self.id }
+        fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+        fn cache_ttl() -> Option<Duration> { None }
+        fn cache_max_size() -> usize { 100 }
+    }
+
+    #[test]
+    fn test_critical_keyed_caches() {
+        imc_clear::<CritUser>();
+        let call_count = AtomicU32::new(0);
+        let r1: CritUser = through_critical_keyed(CritUserKey::ByEmail("alice".into()), || {
+            call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            CritUser { id: 1, name: "Alice".into() }
+        });
+        assert_eq!(r1.name, "Alice");
+        assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+
+        let r2: CritUser = through_critical_keyed(CritUserKey::ByEmail("alice".into()), || {
+            call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            CritUser { id: 1, name: "WRONG".into() }
+        });
+        assert_eq!(r2.name, "Alice");
+        assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_critical_keyed_registers_channel() {
+        imc_clear::<CritUser>();
+        let _: CritUser = through_critical_keyed(CritUserKey::ById(42), || {
+            CritUser { id: 42, name: "Bob".into() }
+        });
+        let channels = crate::critical::snapshot_channels();
+        assert!(channels.iter().any(|c| c.contains("CritUserKey")));
+    }
+}

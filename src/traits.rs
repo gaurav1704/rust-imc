@@ -3,6 +3,31 @@ use std::time::Duration;
 
 use crate::hasher::hash_value;
 
+/// Marker trait for cache keys whose updates should be broadcast
+/// to other pods via Redis pub/sub.
+///
+/// Derive this on your key enum with [`#[derive(CriticalKey)]`](imc_derive::CriticalKey)
+/// to automatically invalidate the corresponding cache entry across all
+/// pods whenever [`through_imc_keyed`](crate::through_imc_keyed) stores a
+/// new value for that key.
+///
+/// Requires the `critical` feature.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Hash, Clone, CriticalKey)]
+/// enum UserKey { ById(i32), ByEmail(String) }
+/// ```
+#[cfg(feature = "critical")]
+pub trait CriticalKey: Hash + Clone + Send + 'static {
+    /// Pub/sub channel name for this key type.
+    ///
+    /// The derive macro generates this automatically from
+    /// `module_path!() + "::" + type_name`.
+    fn channel() -> &'static str;
+}
+
 /// Eviction strategy for a per-type cache namespace.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CacheStrategy {

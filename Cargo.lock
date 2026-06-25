@@ -219,11 +219,21 @@ dependencies = [
 name = "imc"
 version = "0.1.0"
 dependencies = [
+ "imc-derive",
  "prometheus",
  "redis",
  "serial_test",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "imc-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

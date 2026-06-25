@@ -10,15 +10,26 @@ pub(crate) mod metrics;
 #[cfg(feature = "invalidation-redis")]
 pub(crate) mod invalidation;
 
+#[cfg(feature = "critical")]
+pub(crate) mod critical;
+
 #[cfg(test)]
 mod tests;
 
 pub use traits::{CacheStrategy, ImcCacheable};
+#[cfg(feature = "critical")]
+pub use traits::CriticalKey;
 pub use worker::{CacheWorker, WorkerConfig};
 pub use api::{through_imc, through_imc_keyed, imc_remove, imc_clear, imc_len, imc_invalidation_id};
 
+#[cfg(feature = "critical")]
+pub use api::through_critical_keyed;
+
 #[cfg(any(feature = "async", feature = "tokio"))]
 pub use api::{through_imc_async, through_imc_keyed_async};
+
+#[cfg(all(any(feature = "async", feature = "tokio"), feature = "critical"))]
+pub use api::through_critical_keyed_async;
 
 // ---------------------------------------------------------------------------
 // Library lifecycle

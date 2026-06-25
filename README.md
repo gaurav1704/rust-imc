@@ -18,8 +18,9 @@ assert_eq!(user.id, same.id); // same backing entry
 | `async` | no | Enables `through_imc_async` for async closure support (runtime-agnostic) |
 | `tokio` | no | Implies `async` + makes `CacheWorker` use `tokio::task::spawn_blocking` instead of `std::thread` |
 | `invalidation-redis` | no | Cross-process cache invalidation via Redis pub/sub (optional `redis` crate dep) |
+| `critical` | no | Critical-key broadcast via Redis pub/sub. Implies `invalidation-redis`. Adds `through_critical_keyed` / `through_critical_keyed_async` and `#[derive(CriticalKey)]` |
 | `logging` | no | Structured tracing events via `log_event!` macro (uses `tracing`). Format controlled by your app's subscriber |
-| `metrics-prometheus` | no | Prometheus metrics (hits, misses, sets, evictions, entries) pushed to a Push Gateway via `metrics::push()` |
+| `metrics-prometheus` | no | Prometheus metrics (hits, misses, sets, evictions, entries) exposed via HTTP `/metrics` endpoint |
 
 ---
 
@@ -485,3 +486,41 @@ through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || fetch_user_by
 ```
 
 The original `through_imc` (free-form key) and `through_imc_keyed` (typed key) coexist — use whichever fits your call site. Async equivalents `through_imc_async` / `through_imc_keyed_async` are available under the `async` or `tokio` features.
+
+### Critical keys (cross-pod broadcast)
+
+Enable the `critical` feature and derive `CriticalKey` on your key enum to automatically broadcast invalidation messages whenever `through_critical_keyed` stores a new value. Other pods subscribed to the same Redis channel will evict their stale copy.
+
+```rust
+use imc::{CacheStrategy, ImcCacheable, through_critical_keyed, CriticalKey};
+use imc_derive::CriticalKey;
+
+#[derive(Hash, Clone, CriticalKey)]
+enum UserKey { ById(i32), ByEmail(String) }
+
+impl ImcCacheable for User {
+    type Id = i32;
+    type Key = UserKey;
+    // … other trait methods unchanged
+}
+
+// ── Pod A caches a user ─────────────────────────────────────────
+let u = through_critical_keyed(UserKey::ByEmail("alice@example.com".into()), || {
+    fetch_user_from_db("alice@example.com")
+});
+
+// ── Pod B updates the same user and calls through_critical_keyed ─
+// The key hash is published on the "UserKey" channel.
+// Pod A's subscriber receives it and evicts the stale entry.
+let u = through_critical_keyed(UserKey::ByEmail("alice@example.com".into()), || {
+    fetch_user_from_db("alice@example.com")  // fresh from DB
+});
+```
+
+**How it works:**
+- The derive macro implements `CriticalKey` for the enum, providing a channel name derived from `module_path!() + "::" + type_name`.
+- `through_critical_keyed` behaves exactly like `through_imc_keyed` but additionally registers the channel and publishes the key hash after storing.
+- `CacheWorker::spawn_with_config` automatically starts a Redis subscriber thread when `redis_connection_string` is set and the `critical` feature is enabled.
+- On receiving a message, the subscriber removes the cache entry by its key hash. The next read fetches fresh data.
+
+Note: The regular `through_imc_keyed` does **not** broadcast — use `through_critical_keyed` (or `through_critical_keyed_async`) when you need cross-pod cache coherency.

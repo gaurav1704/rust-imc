@@ -4,10 +4,21 @@ use std::sync::Mutex;
 #[cfg(not(feature = "tokio"))]
 use std::thread::JoinHandle;
 use std::time::Duration;
+#[cfg(feature = "critical")]
+use std::sync::OnceLock;
 
 use crate::cache::global;
 use crate::hasher::hash_value;
 use crate::traits::ImcCacheable;
+
+/// Global Redis URL used by the critical-key publisher thread.
+#[cfg(feature = "critical")]
+static REDIS_URL: OnceLock<String> = OnceLock::new();
+
+#[cfg(feature = "critical")]
+pub(crate) fn get_redis_url() -> Option<&'static str> {
+    REDIS_URL.get().map(|s| s.as_str())
+}
 
 // ---------------------------------------------------------------------------
 // Background worker command
@@ -94,6 +105,8 @@ pub struct CacheWorker {
     _handle: WorkerJoinHandle,
     #[cfg(feature = "invalidation-redis")]
     _redis_handle: Option<WorkerJoinHandle>,
+    #[cfg(feature = "critical")]
+    _critical_handle: Option<WorkerJoinHandle>,
     #[cfg(feature = "metrics-prometheus")]
     _metrics_handle: Option<WorkerJoinHandle>,
 }
@@ -144,6 +157,17 @@ impl CacheWorker {
             None
         };
 
+        #[cfg(feature = "critical")]
+        let critical_handle = if let Some(ref redis_url) = config.redis_connection_string {
+            let url = redis_url.clone();
+            let _ = REDIS_URL.set(redis_url.clone());
+            Some(spawn_worker_thread("imc-critical", move || {
+                crate::critical::subscriber_loop(&url)
+            }))
+        } else {
+            None
+        };
+
         #[cfg(feature = "metrics-prometheus")]
         let metrics_handle = if let Some(ref addr) = config.metrics_listen_addr {
             let addr = addr.clone();
@@ -165,6 +189,8 @@ impl CacheWorker {
             _handle: handle,
             #[cfg(feature = "invalidation-redis")]
             _redis_handle: redis_handle,
+            #[cfg(feature = "critical")]
+            _critical_handle: critical_handle,
             #[cfg(feature = "metrics-prometheus")]
             _metrics_handle: metrics_handle,
         }

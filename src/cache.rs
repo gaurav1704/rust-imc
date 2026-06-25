@@ -123,6 +123,18 @@ impl PerTypeCache {
         crate::log_event!(DEBUG, crate::log::CACHE, crate::log::REMOVE, id_hash = id_hash);
     }
 
+    #[cfg(feature = "critical")]
+    pub(crate) fn remove_by_args_hash(&mut self, args_hash: u64) {
+        if let Some(id_hash) = self.index.remove(&args_hash) {
+            let still_referenced = self.index.values().any(|v| *v == id_hash);
+            if !still_referenced {
+                self.data.remove(&id_hash);
+            }
+            crate::log_event!(DEBUG, crate::log::CACHE, crate::log::REMOVE,
+                args_hash = args_hash, id_hash = id_hash);
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         let count = self.data.len();
         self.data.clear();
