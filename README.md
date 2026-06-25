@@ -1,6 +1,6 @@
 # imc — In-Memory Cache
 
-A trait-based, deduplicating, in-memory cache for Rust. One data copy per unique identity, even when the same record is fetched through different query arguments.
+A trait-based, deduplicating, in-memory cache. One data copy per unique identity, even when the same record is fetched through different query arguments.
 
 ```rust
 let user = through_imc(user_id, || db::fetch_user(user_id));
@@ -10,85 +10,445 @@ assert_eq!(user.id, same.id); // same backing entry
 
 ---
 
-## Features
+## Quick Start
+
+```toml
+[dependencies]
+imc = { git = "https://github.com/gaurav1704/rust-imc" }
+```
+
+```rust
+use imc::{ImcCacheable, CacheStrategy, through_imc};
+use std::time::Duration;
+
+// ── 1.  Define your type and configure caching ────────────────────────
+#[derive(Clone)]
+struct User { id: u32, name: String }
+
+impl ImcCacheable for User {
+    type Id = u32;
+    type Key = String;
+
+    fn cache_id(&self) -> u32 { self.id }
+
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+    fn cache_max_size() -> usize { 10_000 }
+}
+
+// ── 2.  Wrap expensive operations ─────────────────────────────────────
+let u: User = through_imc(42u32, || fetch_user_by_id(42));
+let u2: User = through_imc("alice@example.com", || fetch_user_by_email("alice"));
+assert_eq!(u.id, u2.id); // one backing entry
+```
+
+---
+
+## Core API
+
+### `CacheStrategy` (enum)
+
+| Variant | Eviction rule |
+|---------|---------------|
+| `Lru` | Least Recently Used — evicts the entry with the oldest `last_accessed` timestamp |
+| `Mru` | Most Recently Used — evicts the entry with the newest `last_accessed` timestamp |
+| `Lfu` | Least Frequently Used — evicts the entry with the lowest `access_count` |
+| `Mfu` | Most Frequently Used — evicts the entry with the highest `access_count` |
+| `Fifo` | First In, First Out — evicts the entry with the earliest `inserted_at` |
+
+### `ImcCacheable` (trait)
+
+Every cacheable type must implement this trait. You must define:
+
+| Item | Type / Signature | Required? |
+|------|------------------|-----------|
+| `type Id` | `Hash + Eq + Clone + Send + 'static` | **yes** |
+| `type Key` | `Hash + Clone + Send + 'static` | **yes** |
+| `fn cache_id(&self) -> Self::Id` | — | **yes** |
+| `fn cache_strategy() -> CacheStrategy` | — | no (default: `Lru`) |
+| `fn cache_ttl() -> Option<Duration>` | — | no (default: `None`) |
+| `fn cache_max_size() -> usize` | — | no (default: `10_000`) |
+| `fn cache_value_size() -> Option<usize>` | — | no (default: `None`) |
+| `fn cache_max_value_size() -> usize` | — | no (default: `1_048_576`) |
+| `fn cache_invalidation_channel() -> Option<&'static str>` | — | no (default: `None`) |
+
+```rust
+use imc::{ImcCacheable, CacheStrategy};
+use std::time::Duration;
+
+#[derive(Clone)]
+struct User { id: u32, name: String }
+
+impl ImcCacheable for User {
+    type Id = u32;
+    type Key = String;
+
+    fn cache_id(&self) -> u32 { self.id }
+
+    // ── Optional trait methods ────────────────────────────────────
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+    fn cache_max_size() -> usize { 10_000 }
+
+    /// Per-value size check — values larger than this bypass the cache.
+    fn cache_value_size(&self) -> Option<usize> {
+        Some(std::mem::size_of::<u32>() + self.name.len())
+    }
+    fn cache_max_value_size() -> usize { 65_536 } // 64 KiB
+
+    /// Cross-process invalidation channel (requires `invalidation-redis`).
+    fn cache_invalidation_channel() -> Option<&'static str> { None }
+}
+```
+
+### `CriticalKey` (trait, requires `critical` feature)
+
+Marker trait for key enums that should broadcast invalidation messages whenever [`through_imc_keyed`] stores a fresh value. Derive it — never implement manually:
+
+```rust
+use imc_derive::CriticalKey;
+
+#[derive(Hash, Clone, CriticalKey)]
+enum UserKey { ById(i32), ByEmail(String) }
+```
+
+When the `critical` feature is enabled, `through_imc_keyed` requires `T::Key: CriticalKey` — you **must** derive `CriticalKey` on every key enum.
+
+### Functions
+
+#### `through_imc(args, || value)` / `through_imc_async(args, || async { value })`
+
+Cache with a free-form key (any `Hash + Clone + Send + 'static`). Two calls that produce the same identity share one entry:
+
+```rust
+let u: User = through_imc(42u32, || fetch_user(42));
+let same: User = through_imc("admin@example.com", || fetch_user_by_email("admin"));
+assert_eq!(u.id, same.id);
+```
+
+Async variant (requires `async` or `tokio` feature):
+
+```rust
+let u: User = through_imc_async(42u32, || async { fetch_user(42).await }).await;
+```
+
+#### `through_imc_keyed(key, || value)` / `through_imc_keyed_async(key, || async { value })`
+
+Same as `through_imc` but with a compiler-enforced key type:
+
+```rust
+#[derive(Hash, Clone)]
+enum UserKey { ById(i32), ByEmail(String) }
+
+impl ImcCacheable for User {
+    type Id = i32;
+    type Key = UserKey;
+    // …
+}
+
+through_imc_keyed(UserKey::ById(42), || fetch_user_by_id(42));
+// through_imc_keyed("anything", || …); // ✗ compile error
+```
+
+When the `critical` feature is enabled, broadcast is automatic (see [Critical keys](#critical-keys-cross-pod-broadcast)).
+
+#### `imc_remove::<T>(&id)`
+
+Remove a single entry by its identity:
+
+```rust
+imc_remove::<User>(&42);
+```
+
+#### `imc_clear::<T>()`
+
+Evict every cached entry for type `T`:
+
+```rust
+imc_clear::<User>();
+```
+
+#### `imc_len::<T>() -> usize`
+
+Number of unique entries currently cached for type `T`.
+
+#### `imc_invalidation_id::<T>(&id) -> String`
+
+Compute the stable hash string for cross-process invalidation (see [Redis cross-process invalidation](#redis-cross-process-invalidation)).
+
+### Macros
+
+#### `log_event!`
+
+```rust
+log_event!(INFO, CACHE, HIT, "cache hit for args_hash={}", args_hash);
+log_event!(DEBUG, CACHE, EVICT, id_hash = id_hash);
+log_event!(WARN, CACHE, SET, "value too large, skipping");
+```
+
+Requires the `logging` feature. Expands to nothing at compile time when the feature is off.
+
+---
+
+## Feature Flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | — | always | Core caching: `through_imc`, dedup, eviction, TTL |
-| `async` | no | Enables `through_imc_async` for async closure support (runtime-agnostic) |
-| `tokio` | no | Implies `async` + makes `CacheWorker` use `tokio::task::spawn_blocking` instead of `std::thread` |
-| `invalidation-redis` | no | Cross-process cache invalidation via Redis pub/sub (optional `redis` crate dep) |
+| `async` | no | Enables `through_imc_async` / `through_imc_keyed_async` (runtime-agnostic) |
+| `tokio` | no | Implies `async` + makes `CacheWorker` use `tokio::task::spawn_blocking` |
+| `invalidation-redis` | no | Cross-process cache invalidation via Redis pub/sub |
 | `critical` | no | Critical-key broadcast via Redis pub/sub. Implies `invalidation-redis`. Requires `#[derive(CriticalKey)]` on key enums used with `through_imc_keyed` |
-| `logging` | no | Structured tracing events via `log_event!` macro (uses `tracing`). Format controlled by your app's subscriber |
-| `metrics-prometheus` | no | Prometheus metrics (hits, misses, sets, evictions, entries) exposed via HTTP `/metrics` endpoint |
+| `logging` | no | Structured tracing events via `log_event!` macro |
+| `metrics-prometheus` | no | Prometheus counters / gauges + HTTP `/metrics` endpoint |
 
 ---
 
-## Configuration
+## Advanced Usage
 
-Every setting is defined **per-type** via the `ImcCacheable` trait.
+### Lifecycle
 
-### `cache_id()`
-- **Purpose:** Extract the unique identity from a value after it is fetched.
-- **Values:** Any `Hash + Eq + Clone + Send + 'static` type.
-- **Behaviour:** Two query `args` that produce values with the same `cache_id()` share a single backing entry (dedup). A third `args` producing a different `cache_id()` creates a separate entry.
+The global cache store initialises lazily on first use. For explicit control:
 
-### `cache_strategy()`
-- **Purpose:** Which entry to evict when the namespace is full.
-- **Values:** `Lru` / `Mru` / `Lfu` / `Mfu` / `Fifo`
-- **Behaviour:**
+```rust
+use imc::Imc;
 
-#### `Lru` — Least Recently Used
-Evicts the entry whose `last_accessed` timestamp is the oldest — i.e., the one that has gone the longest without being read. Good general-purpose default for most workloads where recently accessed data is likely to be accessed again soon. Each `get()` updates the timestamp.
+// Option A — just ensure the store exists (no background worker):
+Imc::init();
 
-#### `Mru` — Most Recently Used
-Evicts the entry whose `last_accessed` timestamp is the newest — i.e., the one that was just read. Useful when older data is more valuable (e.g., caches for sequential-scan or streaming workloads where the latest item is unlikely to be re-read).
+// Option B — init + spawn a background maintenance worker:
+let _worker = Imc::start(Default::default());
+```
 
-#### `Lfu` — Least Frequently Used
-Evicts the entry with the lowest `access_count`. Keeps frequently accessed data warm, even if it hasn't been touched recently. Each `get()` increments the counter. Good for workloads with a stable "hot set" of popular records.
+`Imc::start` is equivalent to `Imc::init()` + `CacheWorker::spawn()`.
 
-#### `Mfu` — Most Frequently Used
-Evicts the entry with the highest `access_count`. Makes room for fresh entries by discarding the most popular one. Useful in specialized cases where you want to force rotation of heavily accessed data.
+### Worker / Background Maintenance
 
-#### `Fifo` — First In, First Out
-Evicts the entry that was inserted earliest (`inserted_at`). Ignores access patterns entirely — no timestamp or counter is updated. Simple and predictable; useful when all entries are equally likely to be re-read and you just need a size cap.
+```rust
+use imc::{CacheWorker, WorkerConfig};
+use std::time::Duration;
 
-### `cache_ttl()`
-- **Purpose:** Time-to-live for entries in this namespace.
-- **Values:** `Some(Duration)` or `None` (never expire)
-- **Behaviour:** Expired entries are treated as a miss on `get()` and are replaced on the next `set()`. Stale entries are cleaned up during the background worker sweep.
+let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+    sweep_interval: Duration::from_secs(10),
+    #[cfg(feature = "metrics-prometheus")]
+    metrics_listen_addr: Some("127.0.0.1:9090".into()),
+    #[cfg(feature = "invalidation-redis")]
+    redis_connection_string: Some("redis://localhost:6379".into()),
+});
+```
 
-### `cache_max_size()`
-- **Purpose:** Maximum number of unique entries allowed.
-- **Values:** Any `usize`. Default: `10_000`.
-- **Behaviour:** When the namespace is at capacity and a new entry arrives, the eviction strategy selects one entry to remove. Inline eviction fires on every `set()`; when a `CacheWorker` is active, inline eviction is deferred to the periodic background sweep.
+While the worker is alive, inline eviction at `set()` is deferred to the periodic background sweep, keeping the hot path lock-free.
 
-### `cache_value_size()`
-- **Purpose:** Report the approximate byte-size of a value for the per-value size limit.
-- **Values:** `Some(usize)` or `None` (unknown — skip size check, always cache). Default: `None`.
-- **Behaviour:** When this returns a size and it exceeds [`cache_max_value_size()`](#cache_max_value_size), the value bypasses the cache entirely (returned directly to the caller without storing).
+### Redis cross-process invalidation
 
-### `cache_max_value_size()`
-- **Purpose:** Maximum byte-size of a single cached value.
-- **Values:** Any `usize`. Default: `1_048_576` (1 MiB).
-- **Behaviour:** Only takes effect when [`cache_value_size()`](#cache_value_size) is implemented and returns `Some(size)`. Values larger than this limit are not cached — the closure runs every time.
+**Requires:** `invalidation-redis` feature.
 
-### `cache_invalidation_channel()`
-- **Purpose:** Enable cross-process cache invalidation via pub/sub.
-- **Values:** `Some("channel_name")` or `None` (disabled).
-- **Behaviour:** When set and the `invalidation-redis` feature is enabled, the type's channel is registered with the background worker. On spawn with a Redis URL, the worker subscribes to all registered channels. A message on that channel (a stable FNV-1a hash of the `Id` as a stringified `u64`) removes the corresponding entry from every subscribing pod.
+```toml
+[dependencies]
+imc = { git = "https://github.com/gaurav1704/rust-imc", features = ["invalidation-redis"] }
+redis = "0.27"
+```
 
-### `WorkerConfig`
-- **Purpose:** Configuration for the background maintenance worker.
-- **Fields:**
-  - `sweep_interval: Duration` — how often the worker sweeps for expired and excess entries (default: 10s)
-  - `metrics_listen_addr: Option<String>` — listen address for the Prometheus `/metrics` HTTP endpoint (e.g. `"127.0.0.1:9090"`). Requires the `metrics-prometheus` feature.
-  - `redis_connection_string: Option<String>` — Redis URL for invalidation (only when `invalidation-redis` feature is enabled)
-- **Behaviour:** The worker runs a single background thread that receives remove/clear/shutdown commands and periodically calls `remove_expired()` + `evict_to_max_size()` on every registered type. While the worker is active, inline eviction in `set()` is skipped to keep the hot path lock-free.
+```rust
+use imc::{ImcCacheable, CacheStrategy, CacheWorker, WorkerConfig, imc_invalidation_id};
+use std::time::Duration;
+
+// ── 1.  Configure invalidation channel on your type ────────────────────
+impl ImcCacheable for User {
+    // … type Id, cache_id, etc.
+    fn cache_invalidation_channel() -> Option<&'static str> { Some("users") }
+}
+
+// ── 2.  Spawn worker + subscriber on every pod ─────────────────────────
+let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+    sweep_interval: Duration::from_secs(10),
+    redis_connection_string: Some("redis://localhost:6379".into()),
+    ..Default::default()
+});
+
+// ── 3.  On mutation, publish the stable hash ───────────────────────────
+fn on_user_updated(user_id: i32) {
+    let client = redis::Client::open("redis://localhost:6379").unwrap();
+    let mut conn = client.get_connection().unwrap();
+    let hash = imc_invalidation_id::<User>(&user_id);
+    let _: () = redis::Cmd::publish("users", hash).query(&mut conn).unwrap();
+}
+```
+
+Key points:
+- Every pod runs the subscriber (via `WorkerConfig::redis_connection_string`).
+- Only the mutating pod calls `publish_invalidation` — imc does not auto-publish.
+- The FNV-1a hash is deterministic across pods, so all pods agree on which entry to remove.
+- Subscribers reconnect with a 5‑second backoff on error.
+
+### Multi-condition queries & `Vec<T>` result sets
+
+Tuple args work as cache keys. The `Vec<T>` blanket impl caches entire filtered result sets:
+
+```rust
+use imc::{ImcCacheable, CacheStrategy, through_imc};
+use std::time::Duration;
+
+// ── 1.  Domain type (Id = i32) ────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub struct User { pub id: i32, pub name: String, pub region: String, pub age: i32 }
+
+impl ImcCacheable for User {
+    type Id = i32;
+    type Key = String;
+    fn cache_id(&self) -> i32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(120)) }
+    fn cache_max_size() -> usize { 5_000 }
+}
+
+// ── 2.  Single-row query with two conditions ───────────────────────────
+fn get_user_by_age_and_region(age: i32, region: &str) -> User {
+    through_imc((age, region.to_string()), || {
+        // Runs only when (age, region) has not been cached
+        fetch_user_raw(age, region)
+    })
+}
+
+// ── 3.  Result set — Vec<User> implements ImcCacheable automatically ───
+// cache_id() hashes all element IDs together. Two queries returning the
+// same logical set of users share one cached Vec.
+fn get_users_by_region(region: &str) -> Vec<User> {
+    through_imc(("list", region.to_string()), || {
+        fetch_users_raw(region)
+    })
+}
+```
+
+### Per-value size limit
+
+```rust
+impl ImcCacheable for User {
+    // …
+    fn cache_value_size(&self) -> Option<usize> {
+        Some(std::mem::size_of::<i32>() * 3 + self.name.len() + self.region.len())
+    }
+    fn cache_max_value_size() -> usize { 65_536 } // 64 KiB
+}
+// Values larger than 64 KiB bypass the cache entirely:
+let big = through_imc("large_blob", || fetch_huge_user()); // never stored
+```
+
+### Typed keys
+
+Override `type Key` with a closed enum for compiler-enforced cache keys:
+
+```rust
+use imc::{ImcCacheable, CacheStrategy, through_imc_keyed};
+
+#[derive(Hash, Clone)]
+enum UserKey { ById(i32), ByEmail(String) }
+
+impl ImcCacheable for User {
+    type Id = i32;
+    type Key = UserKey;
+    // … other trait methods unchanged
+}
+
+through_imc_keyed(UserKey::ById(42), || fetch_user_by_id(42));
+through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || fetch_user_by_email("alice@example.com"));
+
+// through_imc_keyed("anything", || …); // ✗ compile error
+```
+
+### Critical keys (cross-pod broadcast)
+
+**Requires:** `critical` feature.
+
+When a critical value is recomputed on one pod, all other pods automatically evict their stale copy:
+
+```rust
+use imc::{ImcCacheable, CacheStrategy, through_imc_keyed, CriticalKey};
+use imc_derive::CriticalKey;
+
+#[derive(Hash, Clone, CriticalKey)]
+enum UserKey { ById(i32), ByEmail(String) }
+
+impl ImcCacheable for User {
+    type Id = i32;
+    type Key = UserKey;
+    fn cache_id(&self) -> i32 { self.id }
+    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+    fn cache_max_size() -> usize { 10_000 }
+}
+
+// ── Pod A caches a user ────────────────────────────────────────────────
+let u = through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || {
+    fetch_user_from_db("alice@example.com")
+});
+
+// ── Pod B updates the same user via through_imc_keyed ──────────────────
+// Because UserKey derives CriticalKey, the key hash is automatically
+// published on the critical channel. Pod A receives it and evicts
+// the stale entry. Next read on Pod A fetches fresh data.
+let u = through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || {
+    fetch_user_from_db("alice@example.com") // fresh from DB
+});
+```
+
+How it works:
+1. The `CriticalKey` derive macro generates a channel name from `module_path!() + "::" + type_name`.
+2. When the `critical` feature is enabled, `through_imc_keyed` requires `T::Key: CriticalKey`. After storing, it registers the channel and publishes the key hash.
+3. `CacheWorker::spawn_with_config` automatically starts a Redis subscriber when `redis_connection_string` is set.
+4. The subscriber removes the cache entry by key hash. Publishing is skipped when no subscriber is active.
 
 ---
 
-## Architecture Flow
+## Prometheus Metrics
+
+**Requires:** `metrics-prometheus` feature.
+
+### Configuration
+
+```rust
+let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+    sweep_interval: Duration::from_secs(10),
+    metrics_listen_addr: Some("127.0.0.1:9090".into()),
+    ..Default::default()
+});
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'imc'
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+```
+
+### Metric Reference
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `imc_cache_hits_total` | Counter | Successful `get()` returns |
+| `imc_cache_misses_total` | Counter | Misses + TTL expirations |
+| `imc_cache_sets_total` | Counter | Insertions (new + dedup) |
+| `imc_cache_evictions_total` | Counter | Evictions to stay within `cache_max_size()` |
+| `imc_cache_expired_total` | Counter | TTL-expired entries removed |
+| `imc_cache_invalidation_received_total` | Counter | Cross-process invalidation messages received |
+| `imc_cache_entries` | Gauge | Current unique entries (updated on `imc_len()` + sweep) |
+
+### Manual Access
+
+```rust
+// Encode as Prometheus text format:
+let text = imc::metrics::encode();
+
+// Or start the HTTP server independently:
+std::thread::spawn(|| {
+    imc::metrics::serve("127.0.0.1:9090").unwrap();
+});
+```
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -120,7 +480,7 @@ flowchart TD
     end
 
     subgraph X["Cross-Process Invalidation (feature: invalidation-redis)"]
-        Y["Redis publisher pod:<br/>imc_invalidation_id::⟨T⟩(&id)"] --> Z["Stable hash → channel"]
+        Y["Publisher pod:<br/>imc_invalidation_id::⟨T⟩(&id)"] --> Z["Stable hash → channel"]
         Z --> AA["Redis Pub/Sub"]
         AA --> AB["Subscriber thread<br/>(per pod)"]
         AB --> AC["parse hash →<br/>remove_data(type_id, hash)"]
@@ -128,7 +488,7 @@ flowchart TD
     end
 
     subgraph PD["Prometheus Metrics (feature: metrics-prometheus)"]
-        PE["metrics::record_hit / record_miss /<br/>record_set / record_eviction /<br/>record_expired / record_invalidation_received<br/>set_entries"] --> PF["Local counters & gauges<br/>(prometheus::Registry)"]
+        PE["metrics::record_hit / record_miss /<br/>record_set / record_eviction /<br/>record_expired / record_invalidation_received<br/>set_entries"] --> PF["Local counters & gauges"]
         PF --> PG["HTTP server on metrics_listen_addr<br/>GET /metrics → TextEncoder"]
         PG --> PH["Prometheus scraper pulls<br/> /metrics endpoint"]
     end
@@ -137,388 +497,26 @@ flowchart TD
     D -.->|"on miss"| PE
     G -.->|"on set/evict/expiry"| PE
     O -.->|"after sweep updates entries"| PF
-
     O -.->|"Deferred eviction"| G
     X -.->|"On mutation"| O
 ```
 
 ---
 
-## Prometheus Metrics
-
-When the `metrics-prometheus` feature is enabled, imc maintains a set of counters and a gauge that track cache behaviour. An optional HTTP server exposes them as a Prometheus-scrapable `/metrics` endpoint.
-
-### Configuration
-
-Set `metrics_listen_addr` in `WorkerConfig` to spawn the metrics HTTP server:
-
-```rust
-let _worker = CacheWorker::spawn_with_config(WorkerConfig {
-    sweep_interval: Duration::from_secs(10),
-    metrics_listen_addr: Some("127.0.0.1:9090".into()),
-    ..Default::default()
-});
-```
-
-Prometheus scrapes the endpoint directly — no push gateway needed:
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'imc'
-    static_configs:
-      - targets: ['127.0.0.1:9090']
-```
-
-### Metric Reference
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `imc_cache_hits_total` | Counter | — | Total number of cache lookups that returned a cached value. Incremented on every successful `get()` in `PerTypeCache`. |
-| `imc_cache_misses_total` | Counter | — | Total number of cache lookups that returned no value (miss or TTL expiry). Incremented when `get()` returns `None`. |
-| `imc_cache_sets_total` | Counter | — | Total number of cache insertions (new entries and dedups). Incremented in `PerTypeCache::set()`. |
-| `imc_cache_evictions_total` | Counter | — | Total number of entries evicted to stay within `cache_max_size()`. Incremented on inline eviction (`set()`) and background sweep eviction (`evict_to_max_size()`). |
-| `imc_cache_expired_total` | Counter | — | Total number of TTL-expired entries removed. Incremented in `remove_expired()` and `clear()`. |
-| `imc_cache_invalidation_received_total` | Counter | — | Total number of cross-process invalidation messages received from Redis pub/sub and processed. |
-| `imc_cache_entries` | Gauge | — | Current number of unique entries across all cached types. Updated on every `imc_len()` call and after each sweep. |
-
-### Manual Access
-
-Encode metrics as Prometheus text format at any point:
-
-```rust
-let text = imc::metrics::encode();
-println!("{text}");
-```
-
-Or start the HTTP server independently:
-
-```rust
-std::thread::spawn(|| {
-    imc::metrics::serve("127.0.0.1:9090").unwrap();
-});
-```
-
----
-
-## Lifecycle
-
-The global cache store is lazily initialised on first use, but you can make
-the lifecycle explicit at startup:
-
-```rust
-use imc::Imc;
-
-// Option A — just ensure the store exists (no background worker):
-Imc::init();
-
-// Option B — init + spawn a background maintenance worker:
-let _worker = Imc::start(Default::default());
-// worker runs while _worker is alive; drop it to shut down.
-```
-
-Calling `Imc::start` is equivalent to `Imc::init()` + `CacheWorker::spawn()`.
-
 ## Module Structure
 
 ```
 src/
-├── lib.rs         — Public re-exports, lifecycle (Imc::init / Imc::start)
-├── traits.rs      — ImcCacheable trait, CacheStrategy enum
-├── hasher.rs      — StableHasher (FNV-1a), hash_value(), tick()
-├── entry.rs       — Entry struct with access metadata
-├── cache.rs       — PerTypeCache, GlobalCache, global()
-├── worker.rs      — CacheCmd, CacheWorker, worker_loop, sweep_all
-├── api.rs         — through_imc, through_imc_async, imc_remove, etc.
-├── invalidation.rs— Redis pub/sub subscriber (behind invalidation-redis)
-└── tests.rs       — Unit tests (>30 across all features)
+├── lib.rs          — Public re-exports, lifecycle (Imc::init / Imc::start)
+├── traits.rs       — ImcCacheable trait, CacheStrategy enum, CriticalKey trait
+├── hasher.rs       — StableHasher (FNV-1a), hash_value(), tick()
+├── entry.rs        — Entry struct with access metadata
+├── cache.rs        — PerTypeCache, GlobalCache, global()
+├── worker.rs       — CacheCmd, CacheWorker, worker_loop, sweep_all
+├── api.rs          — through_imc, through_imc_keyed, imc_remove, etc.
+├── critical.rs     — Critical-key registry, publisher, subscriber (behind critical)
+├── invalidation.rs — Redis pub/sub subscriber (behind invalidation-redis)
+├── log.rs          — log_event! macro, component/action constants
+├── metrics.rs      — Prometheus counters, gauge, encode(), serve()
+└── tests.rs        — Unit tests (28+ across all feature combos)
 ```
-
-## Quick Start
-
-```toml
-[dependencies]
-imc = { git = "https://github.com/gaurav1704/rust-imc" }
-```
-
-```rust
-use imc::{ImcCacheable, through_imc};
-use std::time::Duration;
-
-#[derive(Clone)]
-struct User { id: u32, name: String }
-
-impl ImcCacheable for User {
-    type Id = u32;
-    fn cache_id(&self) -> u32 { self.id }
-    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
-    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
-    fn cache_max_size() -> usize { 10_000 }
-}
-
-// First call fetches; subsequent calls with same args or same id return cached.
-let u: User = through_imc(42u32, || fetch_user_by_id(42));
-let u2: User = through_imc("alice@example.com", || fetch_user_by_email("alice"));
-assert_eq!(u.id, u2.id);
-```
-
----
-
-## Examples
-
-### Diesel / PostgreSQL
-
-Wrap Diesel queries with `through_imc` — deduplication across primary-key and alternate-key lookups works automatically.
-
-```rust
-use diesel::prelude::*;
-use imc::{CacheStrategy, ImcCacheable, through_imc};
-use std::time::Duration;
-
-// ── 1.  Model (must be Clone) ──────────────────────────────────────────
-#[derive(Queryable, Identifiable, Clone, Debug, PartialEq)]
-#[diesel(table_name = users)]
-pub struct User {
-    pub id: i32,
-    pub name: String,
-    pub email: String,
-}
-
-// ── 2.  Cache configuration ────────────────────────────────────────────
-impl ImcCacheable for User {
-    type Id = i32;
-
-    fn cache_id(&self) -> i32 { self.id }
-
-    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
-
-    fn cache_ttl() -> Option<Duration> {
-        Some(Duration::from_secs(300))  // 5 minutes
-    }
-
-    fn cache_max_size() -> usize { 10_000 }
-}
-
-// ── 3.  Query helpers ──────────────────────────────────────────────────
-fn get_user_by_id(conn: &mut PgConnection, id: i32) -> QueryResult<User> {
-    // First call runs Diesel; second call with same id returns cached.
-    Ok(through_imc(id, || users::table.find(id).first::<User>(conn)))
-}
-
-fn get_user_by_email(conn: &mut PgConnection, email: &str) -> QueryResult<User> {
-    Ok(through_imc(email.to_string(), || {
-        users::table.filter(users::email.eq(email)).first::<User>(conn)
-    }))
-}
-
-// get_user_by_id(42) and get_user_by_email("alice@example.com") both
-// resolve to User { id: 42, ... }.  The second call returns the
-// cached copy — Diesel never runs.
-```
-
-Key points:
-- The model must derive (or manually implement) `Clone`.
-- The closure borrows `conn` — imc releases the read lock before running it, so there is no deadlock.
-- Use `through_imc_async` with `diesel_async` when using async Diesel.
-
-### Redis cross-process invalidation
-
-Invalidate cached entries across multiple application pods when data is mutated in one of them.
-
-```toml
-[dependencies]
-imc = { git = "https://github.com/gaurav1704/rust-imc", features = ["invalidation-redis"] }
-redis = "0.27"
-```
-
-```rust
-use imc::{CacheStrategy, ImcCacheable, CacheWorker, WorkerConfig, imc_invalidation_id};
-use std::time::Duration;
-
-// ── 1.  Model with invalidation channel ────────────────────────────────
-#[derive(Clone)]
-pub struct User {
-    pub id: i32,
-    pub name: String,
-    pub email: String,
-}
-
-impl ImcCacheable for User {
-    type Id = i32;
-
-    fn cache_id(&self) -> i32 { self.id }
-
-    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
-
-    fn cache_ttl() -> Option<Duration> {
-        Some(Duration::from_secs(300))
-    }
-
-    fn cache_max_size() -> usize { 10_000 }
-
-    // All pods that cache User subscribe to this channel.
-    fn cache_invalidation_channel() -> Option<&'static str> {
-        Some("users")
-    }
-}
-
-// ── 2.  Spawn worker + Redis subscriber on every pod ───────────────────
-let _worker = CacheWorker::spawn_with_config(WorkerConfig {
-    sweep_interval: Duration::from_secs(10),
-    redis_connection_string: Some("redis://localhost:6379".into()),
-});
-
-// ── 3.  On mutation, publish the stable hash to invalidate ─────────────
-// (runs in the pod that performed the INSERT/UPDATE/DELETE)
-fn publish_invalidation(user_id: i32) {
-    let client = redis::Client::open("redis://localhost:6379").unwrap();
-    let mut conn = client.get_connection().unwrap();
-    let hash: String = imc_invalidation_id::<User>(&user_id);
-    let _: () = redis::Cmd::publish("users", hash).query(&mut conn).unwrap();
-}
-
-// After publish_invalidation(42), every pod that subscribes to the
-// "users" channel removes User { id: 42 } from its local cache.
-// The next read re-fetches from the database.
-```
-
-Key points:
-- Every pod runs the subscriber (via `CacheWorker::spawn_with_config` with a `redis_connection_string`).
-- Only the mutating pod needs to call `publish_invalidation` — imc does not auto-publish.
-- The hash is computed with the same FNV-1a `StableHasher` on every pod, so all pods agree on which entry to remove.
-- Subscribers automatically reconnect on error with a 5-second backoff.
-
-### Multi-condition queries & cached result sets
-
-Tuple args let you cache queries with multiple WHERE clauses. Combined with the `Vec<T>` blanket impl, entire filtered result sets are cached and deduplicated.
-
-```rust
-use imc::{CacheStrategy, ImcCacheable, through_imc};
-use std::time::Duration;
-
-// ── 1.  A domain type ──────────────────────────────────────────────────
-#[derive(Clone, Debug)]
-pub struct User {
-    pub id: i32,
-    pub name: String,
-    pub region: String,
-    pub age: i32,
-}
-
-impl ImcCacheable for User {
-    type Id = i32;
-    fn cache_id(&self) -> i32 { self.id }
-    fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
-    fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(120)) }
-    fn cache_max_size() -> usize { 5_000 }
-}
-
-// ── 2.  Single-row query with two conditions ───────────────────────────
-// The args tuple (age, region) becomes the cache key.
-// A second call with the same pair hits the cache.
-fn get_users_by_age_and_region(age: i32, region: &str) -> User {
-    through_imc((age, region.to_string()), || {
-        // e.g. SELECT * FROM users WHERE age > $1 AND region = $2
-        fetch_user_raw(age, region)
-    })
-}
-
-// ── 3.  Result set (Vec) with operator-aware conditions ────────────────
-// The comparison operator is part of the cache key — `age > 10` and
-// `age < 10` produce different tuples and never collide.
-// Vec<User> implements ImcCacheable automatically — cache_id() hashes
-// all element IDs together.  Two different queries that return the same
-// logical set of users share one cached Vec.
-fn get_all_users_by_age_and_region(op: &str, age: i32, region: &str) -> Vec<User> {
-    through_imc(("list", op.to_string(), age, region.to_string()), || {
-        // e.g. SELECT * FROM users WHERE age > $1 AND region = $2
-        //     op = "gt" or "lt" or "gte" …
-        fetch_users_raw(op, age, region)
-    })
-}
-
-// ── 4.  Mix and match ──────────────────────────────────────────────────
-// Tuples with different shapes are distinct cache keys:
-let _ = get_users_by_age_and_region(10, "india");     // key: (10, "india")
-let _ = get_all_users_by_age_and_region("gt", 10, "india"); // key: ("list", "gt", 10, "india")
-```
-
-Any tuple of `Hash + Clone + Send + 'static` values works as the cache key: `(i32, String)`, `(bool, u64, String)`, etc. The `Vec<T>` blanket means you never need a wrapper type for result sets.
-
-### Per-value size limit
-
-Prevent large values from wasting cache capacity by implementing `cache_value_size()`:
-
-```rust
-impl ImcCacheable for User {
-    // …
-    fn cache_value_size(&self) -> Option<usize> {
-        Some(std::mem::size_of::<i32>() * 3 + self.name.len() + self.region.len())
-    }
-    fn cache_max_value_size() -> usize { 65_536 } // 64 KiB
-}
-
-// Values larger than 64 KiB bypass the cache entirely:
-let big = through_imc("large_blob", || fetch_huge_user()); // never stored
-```
-
-### Typed cache keys
-
-By default `through_imc` accepts any `Hash + Clone + Send + 'static` value as a key — flexible, but a typo in a string key silently creates a different cache entry. Override the `Key` associated type on `ImcCacheable` with a closed enum to make invalid keys a compile-time error:
-
-```rust
-use imc::{CacheStrategy, ImcCacheable, through_imc_keyed};
-
-#[derive(Hash, Clone)]
-enum UserKey { ById(i32), ByEmail(String) }
-
-impl ImcCacheable for User {
-    type Id = i32;
-    type Key = UserKey;
-    // … other trait methods unchanged
-}
-
-// Compiler-enforced keys:
-through_imc_keyed(UserKey::ById(42), || fetch_user_by_id(42));
-through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || fetch_user_by_email("alice@example.com"));
-
-// through_imc_keyed("anything", || …); // ✗ compile error — wrong type
-```
-
-The original `through_imc` (free-form key) and `through_imc_keyed` (typed key) coexist — use whichever fits your call site. Async equivalents `through_imc_async` / `through_imc_keyed_async` are available under the `async` or `tokio` features.
-
-### Critical keys (cross-pod broadcast)
-
-Enable the `critical` feature and derive `CriticalKey` on your key enum to automatically broadcast invalidation messages whenever `through_imc_keyed` stores a fresh value. Other pods subscribed to the same Redis channel will evict their stale copy.
-
-```rust
-use imc::{CacheStrategy, ImcCacheable, through_imc_keyed, CriticalKey};
-use imc_derive::CriticalKey;
-
-#[derive(Hash, Clone, CriticalKey)]
-enum UserKey { ById(i32), ByEmail(String) }
-
-impl ImcCacheable for User {
-    type Id = i32;
-    type Key = UserKey;
-    // … other trait methods unchanged
-}
-
-// ── Pod A caches a user ─────────────────────────────────────────
-let u = through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || {
-    fetch_user_from_db("alice@example.com")
-});
-
-// ── Pod B updates the same user and calls through_imc_keyed ─────
-// Because UserKey derives CriticalKey, the key hash is automatically
-// published on the critical channel. Pod A evicts the stale entry.
-let u = through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || {
-    fetch_user_from_db("alice@example.com")  // fresh from DB
-});
-```
-
-**How it works:**
-- The derive macro implements `CriticalKey` for the enum, providing a channel name derived from `module_path!() + "::" + type_name`.
-- When the `critical` feature is enabled, `through_imc_keyed` requires `T::Key: CriticalKey`. After storing, it registers the channel and publishes the key hash. Publishing is skipped when no subscriber is active.
-- `CacheWorker::spawn_with_config` automatically starts a Redis subscriber thread when `redis_connection_string` is set and the `critical` feature is enabled.
-- On receiving a message, the subscriber removes the cache entry by its key hash. The next read fetches fresh data.
