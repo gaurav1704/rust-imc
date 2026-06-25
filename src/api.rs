@@ -102,11 +102,64 @@ where
         .expect("value was just stored")
 }
 
+macro_rules! keyed_body {
+    ($key:expr, $f:expr) => {{
+        let type_id = TypeId::of::<T>();
+        let args_hash = hash_value($key);
+
+        {
+            let stores = global().stores.read().unwrap();
+            if let Some(cache) = stores.get(&type_id) {
+                if let Some(value) = cache.get::<T>(args_hash) {
+                    crate::metrics::record_hit();
+                    crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
+                    return value;
+                }
+            }
+        }
+
+        crate::metrics::record_miss();
+        crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
+
+        let value = ($f)();
+        let id = value.cache_id();
+        let id_hash = hash_value(&id);
+        let ttl = T::cache_ttl();
+
+        if let Some(vsize) = value.cache_value_size() {
+            if vsize > T::cache_max_value_size() {
+                crate::log_event!(WARN, crate::log::API, crate::log::SET,
+                    "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
+                return value;
+            }
+        }
+
+        let mut stores = global().stores.write().unwrap();
+        let cache = stores
+            .entry(type_id)
+            .or_insert_with(|| PerTypeCache::from_trait::<T>());
+        cache.set::<T>(args_hash, id_hash, value, ttl);
+
+        #[cfg(feature = "critical")]
+        crate::critical::after_store::<T, T::Key>($key, args_hash);
+
+        cache
+            .get::<T>(args_hash)
+            .expect("value was just stored")
+    }};
+}
+
 /// Typed-key variant of [`through_imc`].
 ///
 /// Instead of a free-form generic `A`, the key is obtained from the type's
 /// [`ImcCacheable::Key`] associated type.  Override `Key` with a closed enum
 /// to make invalid cache keys a compile-time error.
+///
+/// When the `critical` feature is enabled, the key type **must** derive
+/// [`CriticalKey`](crate::CriticalKey).  After storing a fresh value, the
+/// key hash is broadcast on the type's critical channel so that other pods
+/// can invalidate their stale copy — see the "Critical keys" section in the
+/// README.
 ///
 /// # Example
 ///
@@ -124,113 +177,23 @@ where
 /// through_imc_keyed(UserKey::ByEmail("a@b".into()), || …);          // ✓
 /// // through_imc_keyed("anything", || …);                           // ✗ compile error
 /// ```
-pub fn through_imc_keyed<T, F>(key: T::Key, f: F) -> T
-where
-    T: ImcCacheable,
-    F: FnOnce() -> T,
-{
-    let type_id = TypeId::of::<T>();
-    let args_hash = hash_value(&key);
-
-    {
-        let stores = global().stores.read().unwrap();
-        if let Some(cache) = stores.get(&type_id) {
-            if let Some(value) = cache.get::<T>(args_hash) {
-                crate::metrics::record_hit();
-                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
-                return value;
-            }
-        }
-    }
-
-    crate::metrics::record_miss();
-    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
-
-    let value = f();
-    let id = value.cache_id();
-    let id_hash = hash_value(&id);
-    let ttl = T::cache_ttl();
-
-    if let Some(vsize) = value.cache_value_size() {
-        if vsize > T::cache_max_value_size() {
-            crate::log_event!(WARN, crate::log::API, crate::log::SET,
-                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
-            return value;
-        }
-    }
-
-    let mut stores = global().stores.write().unwrap();
-    let cache = stores
-        .entry(type_id)
-        .or_insert_with(|| PerTypeCache::from_trait::<T>());
-    cache.set::<T>(args_hash, id_hash, value, ttl);
-
-    cache
-        .get::<T>(args_hash)
-        .expect("value was just stored")
-}
-
-/// Critical-key variant of [`through_imc_keyed`].
-///
-/// Requires the `critical` feature and `T::Key` to implement [`CriticalKey`](crate::CriticalKey).
-/// After computing and storing a fresh value, this function broadcasts the key hash
-/// on the type's critical channel so that other pods can invalidate their stale copy.
-///
-/// The key type **must** derive [`CriticalKey`](imc_derive::CriticalKey):
-///
-/// ```ignore
-/// #[derive(Hash, Clone, CriticalKey)]
-/// enum UserKey { ById(i32), ByEmail(String) }
-/// ```
 #[cfg(feature = "critical")]
-pub fn through_critical_keyed<T, F>(key: T::Key, f: F) -> T
+pub fn through_imc_keyed<T, F>(key: T::Key, f: F) -> T
 where
     T: ImcCacheable,
     T::Key: crate::CriticalKey,
     F: FnOnce() -> T,
 {
-    let type_id = TypeId::of::<T>();
-    let args_hash = hash_value(&key);
+    keyed_body!(&key, f)
+}
 
-    {
-        let stores = global().stores.read().unwrap();
-        if let Some(cache) = stores.get(&type_id) {
-            if let Some(value) = cache.get::<T>(args_hash) {
-                crate::metrics::record_hit();
-                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
-                return value;
-            }
-        }
-    }
-
-    crate::metrics::record_miss();
-    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
-
-    let value = f();
-    let id = value.cache_id();
-    let id_hash = hash_value(&id);
-    let ttl = T::cache_ttl();
-
-    if let Some(vsize) = value.cache_value_size() {
-        if vsize > T::cache_max_value_size() {
-            crate::log_event!(WARN, crate::log::API, crate::log::SET,
-                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
-            return value;
-        }
-    }
-
-    let mut stores = global().stores.write().unwrap();
-    let cache = stores
-        .entry(type_id)
-        .or_insert_with(|| PerTypeCache::from_trait::<T>());
-    cache.set::<T>(args_hash, id_hash, value, ttl);
-
-    crate::critical::register::<T>();
-    crate::critical::publish::<T, T::Key>(&key, args_hash);
-
-    cache
-        .get::<T>(args_hash)
-        .expect("value was just stored")
+#[cfg(not(feature = "critical"))]
+pub fn through_imc_keyed<T, F>(key: T::Key, f: F) -> T
+where
+    T: ImcCacheable,
+    F: FnOnce() -> T,
+{
+    keyed_body!(&key, f)
 }
 
 /// Async version of [`through_imc`].
@@ -285,111 +248,76 @@ where
         .expect("value was just stored")
 }
 
-/// Typed-key variant of [`through_imc_async`].
-///
-/// See [`through_imc_keyed`] for details — this is the async equivalent.
 #[cfg(any(feature = "async", feature = "tokio"))]
-pub async fn through_imc_keyed_async<T, F, Fut>(key: T::Key, f: F) -> T
-where
-    T: ImcCacheable,
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = T>,
-{
-    let type_id = TypeId::of::<T>();
-    let args_hash = hash_value(&key);
+macro_rules! keyed_async_body {
+    ($key:expr, $f:expr) => {{
+        let type_id = TypeId::of::<T>();
+        let args_hash = hash_value($key);
 
-    {
-        let stores = global().stores.read().unwrap();
-        if let Some(cache) = stores.get(&type_id) {
-            if let Some(value) = cache.get::<T>(args_hash) {
-                crate::metrics::record_hit();
-                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
+        {
+            let stores = global().stores.read().unwrap();
+            if let Some(cache) = stores.get(&type_id) {
+                if let Some(value) = cache.get::<T>(args_hash) {
+                    crate::metrics::record_hit();
+                    crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
+                    return value;
+                }
+            }
+        }
+
+        crate::metrics::record_miss();
+        crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
+
+        let value = ($f)().await;
+        let id = value.cache_id();
+        let id_hash = hash_value(&id);
+        let ttl = T::cache_ttl();
+
+        if let Some(vsize) = value.cache_value_size() {
+            if vsize > T::cache_max_value_size() {
+                crate::log_event!(WARN, crate::log::API, crate::log::SET,
+                    "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
                 return value;
             }
         }
-    }
 
-    crate::metrics::record_miss();
-    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
+        let mut stores = global().stores.write().unwrap();
+        let cache = stores
+            .entry(type_id)
+            .or_insert_with(|| PerTypeCache::from_trait::<T>());
+        cache.set::<T>(args_hash, id_hash, value, ttl);
 
-    let value = f().await;
-    let id = value.cache_id();
-    let id_hash = hash_value(&id);
-    let ttl = T::cache_ttl();
+        #[cfg(feature = "critical")]
+        crate::critical::after_store::<T, T::Key>($key, args_hash);
 
-    if let Some(vsize) = value.cache_value_size() {
-        if vsize > T::cache_max_value_size() {
-            crate::log_event!(WARN, crate::log::API, crate::log::SET,
-                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
-            return value;
-        }
-    }
-
-    let mut stores = global().stores.write().unwrap();
-    let cache = stores
-        .entry(type_id)
-        .or_insert_with(|| PerTypeCache::from_trait::<T>());
-    cache.set::<T>(args_hash, id_hash, value, ttl);
-
-    cache
-        .get::<T>(args_hash)
-        .expect("value was just stored")
+        cache
+            .get::<T>(args_hash)
+            .expect("value was just stored")
+    }};
 }
 
-/// Critical-key async variant of [`through_imc_keyed_async`].
+/// Typed-key variant of [`through_imc_async`].
 ///
-/// Requires the `critical` feature and `T::Key` to implement [`CriticalKey`](crate::CriticalKey).
-/// See [`through_critical_keyed`] for details.
+/// See [`through_imc_keyed`] for details — this is the async equivalent.
 #[cfg(all(any(feature = "async", feature = "tokio"), feature = "critical"))]
-pub async fn through_critical_keyed_async<T, F, Fut>(key: T::Key, f: F) -> T
+pub async fn through_imc_keyed_async<T, F, Fut>(key: T::Key, f: F) -> T
 where
     T: ImcCacheable,
     T::Key: crate::CriticalKey,
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
-    let type_id = TypeId::of::<T>();
-    let args_hash = hash_value(&key);
+    keyed_async_body!(&key, f)
+}
 
-    {
-        let stores = global().stores.read().unwrap();
-        if let Some(cache) = stores.get(&type_id) {
-            if let Some(value) = cache.get::<T>(args_hash) {
-                crate::metrics::record_hit();
-                crate::log_event!(DEBUG, crate::log::API, crate::log::HIT, type_id = ?type_id);
-                return value;
-            }
-        }
-    }
-
-    crate::metrics::record_miss();
-    crate::log_event!(DEBUG, crate::log::API, crate::log::MISS, type_id = ?type_id);
-
-    let value = f().await;
-    let id = value.cache_id();
-    let id_hash = hash_value(&id);
-    let ttl = T::cache_ttl();
-
-    if let Some(vsize) = value.cache_value_size() {
-        if vsize > T::cache_max_value_size() {
-            crate::log_event!(WARN, crate::log::API, crate::log::SET,
-                "value too large ({} bytes, max {}), skipping cache", vsize, T::cache_max_value_size());
-            return value;
-        }
-    }
-
-    let mut stores = global().stores.write().unwrap();
-    let cache = stores
-        .entry(type_id)
-        .or_insert_with(|| PerTypeCache::from_trait::<T>());
-    cache.set::<T>(args_hash, id_hash, value, ttl);
-
-    crate::critical::register::<T>();
-    crate::critical::publish::<T, T::Key>(&key, args_hash);
-
-    cache
-        .get::<T>(args_hash)
-        .expect("value was just stored")
+#[cfg(all(any(feature = "async", feature = "tokio"), not(feature = "critical")))]
+pub async fn through_imc_keyed_async<T, F, Fut>(key: T::Key, f: F) -> T
+where
+    T: ImcCacheable,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    keyed_async_body!(&key, f)
 }
 
 /// Remove a single entry (by its unique [`Id`](ImcCacheable::Id)).

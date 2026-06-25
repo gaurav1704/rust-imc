@@ -1,5 +1,6 @@
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::cache::global;
@@ -23,20 +24,6 @@ fn registry() -> &'static Mutex<CriticalRegistry> {
     })
 }
 
-/// Register a value type `T` whose key type `T::Key` implements
-/// [`CriticalKey`].  Called lazily from [`through_imc_keyed`](crate::through_imc_keyed).
-pub(crate) fn register<T: ImcCacheable>()
-where
-    T::Key: CriticalKey,
-{
-    let channel = T::Key::channel();
-    let mut reg = registry().lock().unwrap();
-    reg.channels
-        .entry(channel.to_string())
-        .or_default()
-        .push(TypeId::of::<T>());
-}
-
 /// Return all registered critical channels for the subscriber thread.
 pub(crate) fn snapshot_channels() -> Vec<String> {
     let reg = registry().lock().unwrap();
@@ -47,15 +34,27 @@ pub(crate) fn snapshot_channels() -> Vec<String> {
 // Publishing
 // ---------------------------------------------------------------------------
 
-/// Publish a key hash on the critical channel for `T::Key`.
-///
 /// Called from [`through_imc_keyed`](crate::through_imc_keyed) after storing
-/// a freshly computed value.
-pub(crate) fn publish<T, K>(_key: &K, args_hash: u64)
+/// a freshly computed value.  Registers the channel and publishes the key
+/// hash when a subscriber is active.
+pub(crate) fn after_store<T, K>(_key: &K, args_hash: u64)
 where
-    T: ImcCacheable,
+    T: ImcCacheable<Key = K>,
     K: CriticalKey,
 {
+    // register this (value type, key type) mapping
+    {
+        let mut reg = registry().lock().unwrap();
+        reg.channels
+            .entry(K::channel().to_string())
+            .or_default()
+            .push(TypeId::of::<T>());
+    }
+
+    if !SUBSCRIBER_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+
     let channel = K::channel();
     let payload = args_hash.to_string();
 
@@ -70,6 +69,9 @@ where
         }
     }
 }
+
+/// Set to `true` by the subscriber thread once it begins listening.
+pub(crate) static SUBSCRIBER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Subscriber
@@ -89,6 +91,8 @@ pub(crate) fn subscriber_loop(redis_url: &str) {
             return;
         }
     };
+
+    SUBSCRIBER_ACTIVE.store(true, Ordering::Relaxed);
 
     loop {
         if crate::worker::WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).is_none() {

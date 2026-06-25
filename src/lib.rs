@@ -22,14 +22,8 @@ pub use traits::CriticalKey;
 pub use worker::{CacheWorker, WorkerConfig};
 pub use api::{through_imc, through_imc_keyed, imc_remove, imc_clear, imc_len, imc_invalidation_id};
 
-#[cfg(feature = "critical")]
-pub use api::through_critical_keyed;
-
 #[cfg(any(feature = "async", feature = "tokio"))]
 pub use api::{through_imc_async, through_imc_keyed_async};
-
-#[cfg(all(any(feature = "async", feature = "tokio"), feature = "critical"))]
-pub use api::through_critical_keyed_async;
 
 // ---------------------------------------------------------------------------
 // Library lifecycle

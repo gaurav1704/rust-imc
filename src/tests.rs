@@ -247,6 +247,7 @@ fn test_max_size_enforced() {
 #[derive(Clone, Debug, PartialEq)]
 struct KeyedWidget { id: u32, label: String }
 
+#[cfg_attr(feature = "critical", derive(imc_derive::CriticalKey))]
 #[derive(Hash, Clone, PartialEq, Eq)]
 enum KeyedWidgetKey { ById(u32), ByLabel(String) }
 
@@ -748,14 +749,14 @@ mod critical_tests {
     fn test_critical_keyed_caches() {
         imc_clear::<CritUser>();
         let call_count = AtomicU32::new(0);
-        let r1: CritUser = through_critical_keyed(CritUserKey::ByEmail("alice".into()), || {
+        let r1: CritUser = through_imc_keyed(CritUserKey::ByEmail("alice".into()), || {
             call_count.fetch_add(1, AtomicOrdering::SeqCst);
             CritUser { id: 1, name: "Alice".into() }
         });
         assert_eq!(r1.name, "Alice");
         assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
 
-        let r2: CritUser = through_critical_keyed(CritUserKey::ByEmail("alice".into()), || {
+        let r2: CritUser = through_imc_keyed(CritUserKey::ByEmail("alice".into()), || {
             call_count.fetch_add(1, AtomicOrdering::SeqCst);
             CritUser { id: 1, name: "WRONG".into() }
         });
@@ -766,7 +767,7 @@ mod critical_tests {
     #[test]
     fn test_critical_keyed_registers_channel() {
         imc_clear::<CritUser>();
-        let _: CritUser = through_critical_keyed(CritUserKey::ById(42), || {
+        let _: CritUser = through_imc_keyed(CritUserKey::ById(42), || {
             CritUser { id: 42, name: "Bob".into() }
         });
         let channels = crate::critical::snapshot_channels();
