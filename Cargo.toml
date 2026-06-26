@@ -4,7 +4,7 @@ members = [".", "imc-derive"]
 
 [package]
 name = "imc"
-version = "0.1.1"
+version = "0.1.2"
 description = "Trait-based, deduplicating, in-memory caching library for Rust"
 license = "MIT"
 repository = "https://github.com/gaurav1704/rust-imc"
@@ -25,7 +25,7 @@ redis = { version = "0.27", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread"] }
 tracing = { version = "0.1", optional = true }
 prometheus = { version = "0.13", optional = true }
-imc-derive = { path = "imc-derive", version = "0.1.1", optional = true }
+imc-derive = { path = "imc-derive", version = "0.1.2", optional = true }
 
 [dev-dependencies]
 serial_test = "3"
