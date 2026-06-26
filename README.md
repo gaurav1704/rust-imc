@@ -1,5 +1,9 @@
 # imc — In-Memory Cache
 
+[![Crates.io](https://img.shields.io/crates/v/imc.svg)](https://crates.io/crates/imc)
+[![docs.rs](https://img.shields.io/docsrs/imc)](https://docs.rs/imc)
+[![License](https://img.shields.io/crates/l/imc.svg)](https://crates.io/crates/imc)
+
 A trait-based, deduplicating, in-memory cache. One data copy per unique identity, even when the same record is fetched through different query arguments.
 
 ```rust
