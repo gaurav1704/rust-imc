@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! A trait-based, deduplicating, in-memory cache for Rust.
 //!
 //! One data copy per unique identity, even when the same record is fetched
