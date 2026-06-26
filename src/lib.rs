@@ -1,3 +1,10 @@
+#![doc(
+    html_logo_url = "",
+    html_favicon_url = "",
+    html_root_url = "https://docs.rs/imc"
+)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 mod traits;
 mod hasher;
 mod entry;
@@ -18,11 +25,13 @@ mod tests;
 
 pub use traits::{CacheStrategy, ImcCacheable};
 #[cfg(feature = "critical")]
+#[cfg_attr(docsrs, doc(cfg(feature = "critical")))]
 pub use traits::CriticalKey;
 pub use worker::{CacheWorker, WorkerConfig};
 pub use api::{through_imc, through_imc_keyed, imc_remove, imc_clear, imc_len, imc_invalidation_id};
 
 #[cfg(any(feature = "async", feature = "tokio"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "async", feature = "tokio"))))]
 pub use api::{through_imc_async, through_imc_keyed_async};
 
 // ---------------------------------------------------------------------------

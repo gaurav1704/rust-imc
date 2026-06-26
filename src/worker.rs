@@ -68,12 +68,14 @@ pub struct WorkerConfig {
     /// How often the background thread sweeps for expired & excess entries.
     pub sweep_interval: Duration,
     /// Optional listen address for the Prometheus metrics HTTP endpoint
-    /// (e.g. `"127.0.0.1:9090"`). Requires the `metrics-prometheus` feature.
+    /// (e.g. `"127.0.0.1:9090"`).
     #[cfg(feature = "metrics-prometheus")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "metrics-prometheus")))]
     pub metrics_listen_addr: Option<String>,
     /// Optional Redis connection string for cross-process cache invalidation
-    /// via pub/sub. Requires the `invalidation-redis` feature.
+    /// via pub/sub.
     #[cfg(feature = "invalidation-redis")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "invalidation-redis")))]
     pub redis_connection_string: Option<String>,
 }
 
