@@ -130,7 +130,7 @@ impl Default for WorkerConfig {
 /// remove/clear/shutdown commands.
 ///
 /// When a worker is active the hot-path [`through_imc`](crate::through_imc)
-/// and [`through_imc_async`](crate::through_imc_async) skip inline eviction
+/// and `through_imc_async` skip inline eviction
 /// so that the main thread is never blocked by an O(n) eviction scan.
 ///
 /// # Lifecycle

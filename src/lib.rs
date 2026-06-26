@@ -33,7 +33,7 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | *(none)* | Core caching: [`through_imc`], dedup, eviction, TTL |
-//! | `async` | Enables [`through_imc_async`] / [`through_imc_keyed_async`] (runtime-agnostic) |
+//! | `async` | Enables `through_imc_async` / `through_imc_keyed_async` (runtime-agnostic) |
 //! | `tokio` | Implies `async` + makes [`CacheWorker`] use `tokio::task::spawn_blocking` |
 //! | `invalidation-redis` | Cross-process cache invalidation via Redis pub/sub |
 //! | `critical` | Critical-key broadcast via Redis pub/sub. Implies `invalidation-redis`. Requires `#[derive(CriticalKey)]` on key enums used with [`through_imc_keyed`] |
@@ -95,7 +95,7 @@
 //!
 //! # Re-exports
 //!
-//! The [`CriticalKey`] derive macro is provided by
+//! The `CriticalKey` derive macro is provided by
 //! the `imc-derive` crate and re-exported here for convenience:
 //!
 //! ```rust,ignore
