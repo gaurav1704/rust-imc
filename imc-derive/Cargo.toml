@@ -1,6 +1,6 @@
 [package]
 name = "imc-derive"
-version = "0.1.2"
+version = "0.1.3"
 description = "Proc-macro derive for CriticalKey in the imc caching library"
 license = "MIT"
 repository = "https://github.com/gaurav1704/rust-imc"
