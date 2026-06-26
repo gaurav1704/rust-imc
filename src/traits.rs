@@ -6,7 +6,7 @@ use crate::hasher::hash_value;
 /// Marker trait for cache keys whose updates should be broadcast
 /// to other pods via Redis pub/sub.
 ///
-/// Derive this on your key enum with [`#[derive(CriticalKey)]`](imc_derive::CriticalKey)
+/// Derive this on your key enum with [`#[derive(CriticalKey)]`](crate::CriticalKey)
 /// to automatically invalidate the corresponding cache entry across all
 /// pods whenever [`through_imc_keyed`](crate::through_imc_keyed) stores a
 /// new value for that key.
@@ -15,11 +15,14 @@ use crate::hasher::hash_value;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust,ignore
+/// use imc::CriticalKey;
+///
 /// #[derive(Hash, Clone, CriticalKey)]
 /// enum UserKey { ById(i32), ByEmail(String) }
 /// ```
 #[cfg(feature = "critical")]
+#[cfg_attr(docsrs, doc(cfg(feature = "critical")))]
 pub trait CriticalKey: Hash + Clone + Send + 'static {
     /// Pub/sub channel name for this key type.
     ///
@@ -29,6 +32,21 @@ pub trait CriticalKey: Hash + Clone + Send + 'static {
 }
 
 /// Eviction strategy for a per-type cache namespace.
+///
+/// Each type that implements [`ImcCacheable`] chooses one strategy.
+/// The strategy determines which entry is evicted when the cache
+/// exceeds [`ImcCacheable::cache_max_size`].
+///
+/// # Example
+///
+/// ```rust
+/// use imc::CacheStrategy;
+///
+/// match CacheStrategy::Lru {
+///     CacheStrategy::Lru => println!("evict least recently used"),
+///     _ => unreachable!(),
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CacheStrategy {
     /// Evict the entry accessed **least recently**.
@@ -45,20 +63,48 @@ pub enum CacheStrategy {
 
 /// Any type that should be cacheable **must** implement this trait.
 ///
-/// Implementors define:
-/// - a unique identifier (`Id`) extracted via [`cache_id`](ImcCacheable::cache_id)
-/// - the eviction strategy, TTL and max-size for the type
+/// # Required methods
+///
+/// | Method | Returns | Purpose |
+/// |--------|---------|---------|
+/// | [`cache_id`](ImcCacheable::cache_id) | `Self::Id` | Extract unique identity from a value |
+///
+/// # Associated types
+///
+/// | Type | Bound | Purpose |
+/// |------|-------|---------|
+/// | `Id` | `Hash + Eq + Clone + Send + 'static` | Unique identity (e.g. primary key) |
+/// | `Key` | `Hash + Clone + Send + 'static` | Cache-key type for [`through_imc_keyed`](crate::through_imc_keyed) |
+///
+/// # Optional methods
+///
+/// | Method | Default | Purpose |
+/// |--------|---------|---------|
+/// | [`cache_strategy`](ImcCacheable::cache_strategy) | `Lru` | Eviction strategy |
+/// | [`cache_ttl`](ImcCacheable::cache_ttl) | `None` | Time-to-live per entry |
+/// | [`cache_max_size`](ImcCacheable::cache_max_size) | `10_000` | Max entries per type |
+/// | [`cache_value_size`](ImcCacheable::cache_value_size) | `None` | Byte-size for per-value limit |
+/// | [`cache_max_value_size`](ImcCacheable::cache_max_value_size) | `1_048_576` | Max bytes per value (1 MiB) |
+/// | [`cache_invalidation_channel`](ImcCacheable::cache_invalidation_channel) | `None` | Redis pub/sub channel for cross-process invalidation |
 ///
 /// # Example
 ///
-/// ```ignore
-/// #[derive(Clone)]
-/// struct User { id: u32, name: String }
+/// ```rust
+/// use std::time::Duration;
+/// use imc::{ImcCacheable, CacheStrategy};
 ///
-/// impl ImcCacheable for User {
-///     type Id = u32;
-///     fn cache_id(&self) -> u32 { self.id }
-///     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct Product { id: u64, name: String, price: f64 }
+///
+/// impl ImcCacheable for Product {
+///     type Id = u64;
+///     type Key = String;
+///
+///     fn cache_id(&self) -> u64 { self.id }
+///
+///     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lfu }
+///     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(600)) }
+///     fn cache_max_size() -> usize { 5_000 }
 /// }
 /// ```
 pub trait ImcCacheable: Clone + Send + Sync + 'static {
@@ -69,45 +115,98 @@ pub trait ImcCacheable: Clone + Send + Sync + 'static {
     ///
     /// All types must specify this (typically `type Key = String;`).  Override
     /// with a closed enum to make invalid cache keys a compile-time error.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use imc::ImcCacheable;
+    ///
+    /// #[derive(Hash, Clone)]
+    /// enum UserKey { ById(i32), ByEmail(String) }
+    ///
+    /// # #[derive(Clone)]
+    /// # struct User { id: i32 }
+    /// impl ImcCacheable for User {
+    ///     type Id = i32;
+    ///     type Key = UserKey;
+    ///     fn cache_id(&self) -> i32 { self.id }
+    /// }
+    /// ```
     type Key: Hash + Clone + Send + 'static;
 
     /// Extract the unique identifier from a value *after* it has been
-    /// fetched.  This is used internally to deduplicate entries.
+    /// fetched.  This is what the cache uses for deduplication — two
+    /// queries that return values with the same `cache_id()` share a
+    /// single backing entry.
     fn cache_id(&self) -> Self::Id;
 
     // ── Optional defaults ──────────────────────────────────────────────
 
     /// Eviction strategy for this type's cache namespace.
+    ///
+    /// See [`CacheStrategy`] for the available strategies.
+    ///
+    /// Default: [`CacheStrategy::Lru`].
     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
 
-    /// Time-to-live for cached values.  `None` means they never expire.
+    /// Time-to-live for cached values.
+    ///
+    /// When `Some(duration)` is returned, entries older than `duration`
+    /// are treated as expired on read and removed by the background sweep.
+    /// `None` means entries never expire (eviction-only).
     fn cache_ttl() -> Option<Duration> { None }
 
-    /// Maximum number of entries allowed in this type's namespace.
+    /// Maximum number of entries allowed in this type's cache namespace.
+    ///
+    /// When the number of entries exceeds this limit, the eviction
+    /// strategy (see [`cache_strategy`](ImcCacheable::cache_strategy))
+    /// determines which entry is removed.
     fn cache_max_size() -> usize { 10_000 }
 
-    /// Optional: return the approximate byte-size of `self` for the
-    /// per-value size limit check.  When `Some(s)` is returned and
-    /// `s > cache_max_value_size()` the value is returned directly
-    /// without caching.  `None` means "unknown — always cache".
+    /// Optional: return the approximate byte-size of `self`.
     ///
-    /// ```ignore
-    /// fn cache_value_size(&self) -> Option<usize> {
-    ///     Some(std::mem::size_of_val(self) + self.name.len())
+    /// When `Some(s)` is returned and `s > cache_max_value_size()` the
+    /// value bypasses the cache entirely — the closure executes every time.
+    /// `None` means "unknown — always cache".
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::time::Duration;
+    /// # use imc::{ImcCacheable, CacheStrategy};
+    /// # #[derive(Clone)]
+    /// # struct User { id: u32, name: String }
+    /// impl ImcCacheable for User {
+    /// #     type Id = u32;
+    /// #     type Key = String;
+    /// #     fn cache_id(&self) -> u32 { self.id }
+    ///     fn cache_value_size(&self) -> Option<usize> {
+    ///         Some(std::mem::size_of::<u32>() + self.name.len())
+    ///     }
+    /// #     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+    /// #     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+    /// #     fn cache_max_size() -> usize { 10_000 }
     /// }
     /// ```
     fn cache_value_size(&self) -> Option<usize> { None }
 
-    /// Maximum byte-size of a single cached value.  Values whose
-    /// [`cache_value_size()`](ImcCacheable::cache_value_size) exceeds
-    /// this are not stored (they bypass the cache).
-    /// Default: 1 MiB.
+    /// Maximum byte-size of a single cached value.
+    ///
+    /// Values whose [`cache_value_size()`](ImcCacheable::cache_value_size)
+    /// exceeds this threshold are not stored (they bypass the cache).
+    ///
+    /// Default: **1 MiB** (1_048_576 bytes).
     fn cache_max_value_size() -> usize { 1_048_576 }
 
-    /// Optional: return a pub/sub channel name to enable cross-process
-    /// cache invalidation for this type. Requires the `invalidation-redis`
-    /// feature and a [`CacheWorker`](crate::worker::CacheWorker) with
-    /// [`WorkerConfig::redis_connection_string`](crate::worker::WorkerConfig) configured.
+    /// Optional: return a pub/sub channel name for cross-process
+    /// cache invalidation.
+    ///
+    /// When a channel is configured and the `invalidation-redis` feature
+    /// is enabled, publishing the stable hash of an `Id` on that channel
+    /// removes the entry from every subscribing pod.
+    ///
+    /// See [`imc_invalidation_id`](crate::imc_invalidation_id) and
+    /// [`WorkerConfig::redis_connection_string`](crate::WorkerConfig).
     fn cache_invalidation_channel() -> Option<&'static str> { None }
 }
 
@@ -115,6 +214,16 @@ pub trait ImcCacheable: Clone + Send + Sync + 'static {
 // Blanket impl for Vec<T> — cache entire result sets
 // ---------------------------------------------------------------------------
 
+/// [`Vec<T>`] implements [`ImcCacheable`] when `T` does.
+///
+/// This makes it possible to cache entire filtered result sets obtained
+/// through tuple-based multi-condition keys.
+///
+/// # Dedup
+///
+/// The [`cache_id`](ImcCacheable::cache_id) hashes all element IDs
+/// together.  Two queries returning the same logical set of entities
+/// share one cached `Vec`, even if the query arguments differ.
 impl<T: ImcCacheable> ImcCacheable for Vec<T> {
     type Id = String;
     type Key = String;

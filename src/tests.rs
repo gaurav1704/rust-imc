@@ -610,7 +610,7 @@ fn test_worker_eviction_sweep() {
     fetch::<WkrFifo, _>(4u32, || WkrFifo { id: 4, _val: 40 });
     assert_eq!(imc_len::<WkrFifo>(), 4);
 
-    worker.remove::<WkrFifo>(&999);
+    let _ = worker.remove::<WkrFifo>(&999);
 
     for _ in 0..50 {
         if imc_len::<WkrFifo>() <= 3 {
@@ -662,7 +662,7 @@ fn test_worker_remove_via_command() {
     fetch::<WkrLru, _>(2u32, || WkrLru { id: 2, _val: 20 });
     assert_eq!(imc_len::<WkrLru>(), 2);
 
-    worker.remove::<WkrLru>(&1);
+    let _ = worker.remove::<WkrLru>(&1);
 
     for _ in 0..50 {
         if imc_len::<WkrLru>() == 1 {

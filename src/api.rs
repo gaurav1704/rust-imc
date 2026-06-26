@@ -15,26 +15,39 @@ use crate::traits::ImcCacheable;
 ///
 /// When the returned value is stored its [`cache_id`](ImcCacheable::cache_id)
 /// is extracted.  If an entry with that identity already exists **no
-/// duplicate is created** – the existing copy is kept and the freshly
+/// duplicate is created** — the existing copy is kept and the freshly
 /// computed value is discarded.
 ///
 /// # Free-form args
 ///
 /// The `args` parameter is a free generic — any `Hash + Clone + Send + 'static`
-/// type works.  This gives maximum flexibility but permits accidental cache-key
-/// collisions from typos or inconsistent call sites.
+/// type works.  This gives maximum flexibility:
 ///
-/// ```ignore
-/// through_imc(42u32, || …);                     // single id
-/// through_imc(("gt", 10, "india"), || …);       // tuple of conditions
-/// through_imc("select * from …", || …);         // raw SQL string
+/// ```rust
+/// use std::time::Duration;
+/// use imc::{ImcCacheable, CacheStrategy, through_imc};
+///
+/// # #[derive(Clone, Debug, PartialEq)]
+/// # struct User { id: u32, name: String }
+/// # impl ImcCacheable for User {
+/// #     type Id = u32; type Key = String;
+/// #     fn cache_id(&self) -> u32 { self.id }
+/// #     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+/// #     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+/// #     fn cache_max_size() -> usize { 10_000 }
+/// # }
+/// // Single id:
+/// let u: User = through_imc(42u32, || User { id: 42, name: "Alice".into() });
+///
+/// // Tuple of query conditions:
+/// let results: Vec<User> = through_imc(("age_gt", 10, "IN"), || vec![]);
 /// ```
 ///
 /// For strict, compiler-enforced keys see [`through_imc_keyed`].
 ///
 /// # Example
 ///
-/// ```
+/// ```rust
 /// use std::time::Duration;
 /// use imc::{ImcCacheable, CacheStrategy, through_imc};
 ///
@@ -157,25 +170,39 @@ macro_rules! keyed_body {
 ///
 /// When the `critical` feature is enabled, the key type **must** derive
 /// [`CriticalKey`](crate::CriticalKey).  After storing a fresh value, the
-/// key hash is broadcast on the type's critical channel so that other pods
-/// can invalidate their stale copy — see the "Critical keys" section in the
-/// README.
+/// key hash is automatically broadcast on the type's critical channel so
+/// that other pods can invalidate their stale copy.
 ///
 /// # Example
 ///
-/// ```ignore
-/// #[derive(Hash, Clone)]
+/// ```rust
+/// use std::time::Duration;
+/// use imc::{ImcCacheable, CacheStrategy, through_imc_keyed};
+///
+/// #[derive(Hash, Clone, Debug, PartialEq)]
 /// enum UserKey { ById(i32), ByEmail(String) }
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct User { id: i32, name: String }
 ///
 /// impl ImcCacheable for User {
 ///     type Id = i32;
 ///     type Key = UserKey;
-///     // …
+///     fn cache_id(&self) -> i32 { self.id }
+///     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+///     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+///     fn cache_max_size() -> usize { 10_000 }
 /// }
 ///
-/// through_imc_keyed(UserKey::ById(42), || fetch_user(42));          // ✓
-/// through_imc_keyed(UserKey::ByEmail("a@b".into()), || …);          // ✓
-/// // through_imc_keyed("anything", || …);                           // ✗ compile error
+/// let u: User = through_imc_keyed(UserKey::ById(42), || User { id: 42, name: "Alice".into() });
+/// assert_eq!(u.id, 42);
+///
+/// let u2: User = through_imc_keyed(UserKey::ByEmail("alice@example.com".into()), || {
+///     User { id: 42, name: "Alice".into() }
+/// });
+/// assert_eq!(u, u2);
+///
+/// // through_imc_keyed("anything", || ...); // ✗ compile error — wrong type
 /// ```
 #[cfg(feature = "critical")]
 pub fn through_imc_keyed<T, F>(key: T::Key, f: F) -> T
@@ -199,6 +226,17 @@ where
 /// Async version of [`through_imc`].
 ///
 /// Requires the `async` or `tokio` feature.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use imc::{through_imc_async, ImcCacheable, CacheStrategy};
+/// use std::time::Duration;
+///
+/// let user: User = through_imc_async(42u32, || async {
+///     fetch_user(42).await
+/// }).await;
+/// ```
 #[cfg(any(feature = "async", feature = "tokio"))]
 pub async fn through_imc_async<T, A, F, Fut>(args: A, f: F) -> T
 where
@@ -298,7 +336,20 @@ macro_rules! keyed_async_body {
 
 /// Typed-key variant of [`through_imc_async`].
 ///
-/// See [`through_imc_keyed`] for details — this is the async equivalent.
+/// See [`through_imc_keyed`] for details — this is the async equivalent
+/// for use with async closures.
+///
+/// Requires the `async` or `tokio` feature.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use imc::{through_imc_keyed_async, ImcCacheable, CacheStrategy};
+///
+/// let user: User = through_imc_keyed_async(UserKey::ById(42), || async {
+///     fetch_user(42).await
+/// }).await;
+/// ```
 #[cfg(all(any(feature = "async", feature = "tokio"), feature = "critical"))]
 pub async fn through_imc_keyed_async<T, F, Fut>(key: T::Key, f: F) -> T
 where
@@ -320,7 +371,35 @@ where
     keyed_async_body!(&key, f)
 }
 
-/// Remove a single entry (by its unique [`Id`](ImcCacheable::Id)).
+/// Remove a single entry by its unique [`Id`](ImcCacheable::Id).
+///
+/// After removal, the next [`through_imc`] call for that identity will
+/// re-execute the closure and cache the fresh value.
+///
+/// # Example
+///
+/// ```rust
+/// use std::time::Duration;
+/// use imc::{ImcCacheable, CacheStrategy, through_imc, imc_remove};
+///
+/// # #[derive(Clone, Debug, PartialEq)]
+/// # struct User { id: u32, name: String }
+/// # impl ImcCacheable for User {
+/// #     type Id = u32; type Key = String;
+/// #     fn cache_id(&self) -> u32 { self.id }
+/// #     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+/// #     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+/// #     fn cache_max_size() -> usize { 10_000 }
+/// # }
+/// let u: User = through_imc(42u32, || User { id: 42, name: "Alice".into() });
+/// assert_eq!(u.name, "Alice");
+///
+/// imc_remove::<User>(&42);
+///
+/// // Next call re-executes the closure:
+/// let u2: User = through_imc(42u32, || User { id: 42, name: "Alice Updated".into() });
+/// assert_eq!(u2.name, "Alice Updated");
+/// ```
 pub fn imc_remove<T: ImcCacheable>(id: &T::Id) {
     let type_id = TypeId::of::<T>();
     let id_hash = hash_value(id);
@@ -333,6 +412,31 @@ pub fn imc_remove<T: ImcCacheable>(id: &T::Id) {
 }
 
 /// Evict every cached entry for `T`.
+///
+/// After clearing, all [`through_imc`] calls will re-execute their
+/// closures.
+///
+/// # Example
+///
+/// ```rust
+/// use std::time::Duration;
+/// use imc::{ImcCacheable, CacheStrategy, through_imc, imc_clear, imc_len};
+///
+/// # #[derive(Clone, Debug, PartialEq)]
+/// # struct User { id: u32, name: String }
+/// # impl ImcCacheable for User {
+/// #     type Id = u32; type Key = String;
+/// #     fn cache_id(&self) -> u32 { self.id }
+/// #     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+/// #     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+/// #     fn cache_max_size() -> usize { 10_000 }
+/// # }
+/// let _ = through_imc(42u32, || User { id: 42, name: "Alice".into() });
+/// assert!(imc_len::<User>() > 0);
+///
+/// imc_clear::<User>();
+/// assert_eq!(imc_len::<User>(), 0);
+/// ```
 pub fn imc_clear<T: ImcCacheable>() {
     let type_id = TypeId::of::<T>();
 
@@ -344,6 +448,32 @@ pub fn imc_clear<T: ImcCacheable>() {
 }
 
 /// Number of unique entries currently cached for `T`.
+///
+/// Counts unique identities (not cache-key lookups).  Two different
+/// cache keys that map to the same identity count as one entry.
+///
+/// # Example
+///
+/// ```rust
+/// use std::time::Duration;
+/// use imc::{ImcCacheable, CacheStrategy, through_imc, imc_len, imc_clear};
+///
+/// # #[derive(Clone, Debug, PartialEq)]
+/// # struct User { id: u32, name: String }
+/// # impl ImcCacheable for User {
+/// #     type Id = u32; type Key = String;
+/// #     fn cache_id(&self) -> u32 { self.id }
+/// #     fn cache_strategy() -> CacheStrategy { CacheStrategy::Lru }
+/// #     fn cache_ttl() -> Option<Duration> { Some(Duration::from_secs(300)) }
+/// #     fn cache_max_size() -> usize { 10_000 }
+/// # }
+/// let _ = through_imc(42u32, || User { id: 42, name: "Alice".into() });
+/// let _ = through_imc(43u32, || User { id: 43, name: "Bob".into() });
+/// let _ = through_imc("alice@example.com", || User { id: 42, name: "Alice".into() }); // dedup
+///
+/// assert_eq!(imc_len::<User>(), 2); // two unique identities
+/// # imc_clear::<User>();
+/// ```
 pub fn imc_len<T: ImcCacheable>() -> usize {
     let type_id = TypeId::of::<T>();
 
@@ -359,11 +489,17 @@ pub fn imc_len<T: ImcCacheable>() -> usize {
 /// Only needed when the `invalidation-redis` feature is enabled **and**
 /// [`ImcCacheable::cache_invalidation_channel`] returns a channel name.
 ///
+/// The hash is computed with the same deterministic FNV-1a hasher on
+/// every pod, so all pods agree on which entry to remove.
+///
 /// # Example
 ///
-/// ```ignore
-/// let inval_id = imc_invalidation_id::<User>(&42);
-/// redis_publish("users", inval_id);
+/// ```rust,ignore
+/// use imc::imc_invalidation_id;
+///
+/// // On the mutating pod, after a database INSERT/UPDATE/DELETE:
+/// let hash: String = imc_invalidation_id::<User>(&42);
+/// redis::Cmd::publish("users", hash).query(&mut conn).unwrap();
 /// ```
 pub fn imc_invalidation_id<T: ImcCacheable>(id: &T::Id) -> String {
     let id_hash = hash_value(id);

@@ -8,7 +8,6 @@ use std::time::Duration;
 use std::sync::OnceLock;
 
 use crate::cache::global;
-use crate::hasher::hash_value;
 use crate::traits::ImcCacheable;
 
 /// Global Redis URL used by the critical-key publisher thread.
@@ -24,7 +23,11 @@ pub(crate) fn get_redis_url() -> Option<&'static str> {
 // Background worker command
 // ---------------------------------------------------------------------------
 
-pub(crate) enum CacheCmd {
+/// Commands that can be sent to the background worker thread.
+///
+/// Construct values via [`CacheWorker::remove`] or send them directly
+/// with [`CacheWorker::send`].
+pub enum CacheCmd {
     Remove(TypeId, u64),
     Clear(TypeId),
     ClearAll,
@@ -63,6 +66,33 @@ pub(crate) static WORKER_TX: Mutex<Option<Sender<CacheCmd>>> = Mutex::new(None);
 // ---------------------------------------------------------------------------
 
 /// Configuration for the background maintenance worker.
+///
+/// Pass this to [`CacheWorker::spawn_with_config`] to start periodic
+/// cache maintenance, cross-process invalidation, and Prometheus
+/// metrics serving.
+///
+/// # Example (default — no Redis, no metrics)
+///
+/// ```rust,no_run
+/// use imc::CacheWorker;
+///
+/// let _worker = CacheWorker::spawn_with_config(Default::default());
+/// ```
+///
+/// # Example (with Redis invalidation + Prometheus metrics)
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use imc::{CacheWorker, WorkerConfig};
+///
+/// let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+///     sweep_interval: Duration::from_secs(30),
+///     #[cfg(feature = "invalidation-redis")]
+///     redis_connection_string: Some("redis://127.0.0.1:6379".into()),
+///     #[cfg(feature = "metrics-prometheus")]
+///     metrics_listen_addr: Some("127.0.0.1:9090".into()),
+/// });
+/// ```
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     /// How often the background thread sweeps for expired & excess entries.
@@ -99,188 +129,226 @@ impl Default for WorkerConfig {
 /// entries and evicts over-capacity namespaces, and processes
 /// remove/clear/shutdown commands.
 ///
-/// When a worker is active the hot-path `through_imc` / `through_imc_async`
-/// skip inline eviction so that the main thread is never blocked by an O(n)
-/// eviction scan.
+/// When a worker is active the hot-path [`through_imc`](crate::through_imc)
+/// and [`through_imc_async`](crate::through_imc_async) skip inline eviction
+/// so that the main thread is never blocked by an O(n) eviction scan.
+///
+/// # Lifecycle
+///
+/// - **Spawn** the worker with [`CacheWorker::spawn`] or
+///   [`CacheWorker::spawn_with_config`].
+/// - **Keep alive** for the duration of your application.  The background
+///   thread will shut down when the [`CacheWorker`] is dropped.
+/// - Only **one worker** may exist at a time — spawning a second worker
+///   while one is running will panic.
+///
+/// # Features
+///
+/// | Feature | Effect on worker |
+/// |---------|------------------|
+/// | `invalidation-redis` | Starts a Redis subscriber thread for invalidation messages |
+/// | `critical` | Also starts a critical-key subscriber thread |
+/// | `metrics-prometheus` | Starts an HTTP server on the configured address |
+/// | `tokio` | Uses `tokio::task::spawn_blocking` instead of `std::thread` |
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use imc::{CacheWorker, WorkerConfig};
+///
+/// let _worker = CacheWorker::spawn_with_config(WorkerConfig {
+///     sweep_interval: Duration::from_secs(30),
+///     #[cfg(feature = "metrics-prometheus")]
+///     metrics_listen_addr: Some("127.0.0.1:9090".into()),
+///     #[cfg(feature = "invalidation-redis")]
+///     redis_connection_string: Some("redis://127.0.0.1:6379".into()),
+/// });
+/// // _worker must not be dropped until shutdown
+/// ```
 pub struct CacheWorker {
     tx: Sender<CacheCmd>,
     _handle: WorkerJoinHandle,
     #[cfg(feature = "invalidation-redis")]
-    _redis_handle: Option<WorkerJoinHandle>,
+    _invalidation_handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "critical")]
-    _critical_handle: Option<WorkerJoinHandle>,
-    #[cfg(feature = "metrics-prometheus")]
-    _metrics_handle: Option<WorkerJoinHandle>,
+    _critical_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CacheWorker {
-    /// Spawn a worker with default [`WorkerConfig`].
+    /// Spawn a worker with default configuration.
+    ///
+    /// Equivalent to `CacheWorker::spawn_with_config(WorkerConfig::default())`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a worker is already running.
     pub fn spawn() -> Self {
         Self::spawn_with_config(WorkerConfig::default())
     }
 
-    /// Spawn a worker with a custom configuration.
+    /// Spawn a background worker with the given configuration.
+    ///
+    /// The worker runs a command-and-sweep loop.  While it is alive:
+    ///
+    /// 1. Inline eviction in [`through_imc`](crate::through_imc) is
+    ///    **skipped** — the sweep handles eviction, keeping the hot
+    ///    path lock-free.
+    /// 2. TTL-expired entries are removed every `sweep_interval`.
+    /// 3. If `redis_connection_string` is set and `invalidation-redis`
+    ///    is enabled, a subscriber thread listens for invalidation
+    ///    messages.
+    /// 4. If `metrics_listen_addr` is set and `metrics-prometheus` is
+    ///    enabled, an HTTP server exposes `/metrics`.
     ///
     /// # Panics
     ///
-    /// Panics if a worker is already running (only one instance is allowed).
+    /// Panics if a worker is already running.
     pub fn spawn_with_config(config: WorkerConfig) -> Self {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx): (Sender<CacheCmd>, Receiver<CacheCmd>) = mpsc::channel();
 
-        let mut guard = WORKER_TX.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            guard.is_none(),
-            "an imc background worker is already running"
-        );
-        *guard = Some(tx.clone());
-
-        let cfg_for_loop = WorkerConfig {
-            sweep_interval: config.sweep_interval,
-            #[cfg(feature = "metrics-prometheus")]
-            metrics_listen_addr: config.metrics_listen_addr.clone(),
-            #[cfg(feature = "invalidation-redis")]
-            redis_connection_string: config.redis_connection_string.clone(),
-        };
-
-        let handle = spawn_worker_thread("imc-worker", move || worker_loop(rx, cfg_for_loop));
+        {
+            let mut guard = WORKER_TX.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.is_none(), "only one imc worker may run at a time");
+            *guard = Some(tx.clone());
+        }
 
         #[cfg(feature = "invalidation-redis")]
-        let redis_handle = if let Some(ref redis_url) = config.redis_connection_string {
-            let channels = crate::invalidation::snapshot_channels();
-            if !channels.is_empty() {
+        let invalidation_handle: Option<std::thread::JoinHandle<()>> =
+            if let Some(ref redis_url) = config.redis_connection_string {
+                let channels = crate::invalidation::snapshot_channels();
                 let url = redis_url.clone();
-                Some(spawn_worker_thread("imc-redis", move || {
-                    crate::invalidation::redis_subscriber_loop(&url, channels)
-                }))
+                Some(
+                    std::thread::Builder::new()
+                        .name("imc-invalidation".into())
+                        .spawn(move || crate::invalidation::redis_subscriber_loop(&url, channels))
+                        .expect("failed to spawn invalidation thread"),
+                )
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         #[cfg(feature = "critical")]
-        let critical_handle = if let Some(ref redis_url) = config.redis_connection_string {
-            let url = redis_url.clone();
-            let _ = REDIS_URL.set(redis_url.clone());
-            Some(spawn_worker_thread("imc-critical", move || {
-                crate::critical::subscriber_loop(&url)
-            }))
-        } else {
-            None
-        };
+        let critical_handle: Option<std::thread::JoinHandle<()>> =
+            if let Some(ref redis_url) = config.redis_connection_string {
+                REDIS_URL.set(redis_url.clone()).ok();
+                let url = redis_url.clone();
+                Some(
+                    std::thread::Builder::new()
+                        .name("imc-critical".into())
+                        .spawn(move || crate::critical::subscriber_loop(&url))
+                        .expect("failed to spawn critical subscriber thread"),
+                )
+            } else {
+                None
+            };
 
-        #[cfg(feature = "metrics-prometheus")]
-        let metrics_handle = if let Some(ref addr) = config.metrics_listen_addr {
-            let addr = addr.clone();
-            Some(spawn_worker_thread("imc-metrics", move || {
-                if let Err(e) = crate::metrics::serve(&addr) {
-                    crate::log_event!(ERROR, crate::log::METRICS, crate::log::ERROR,
-                        "metrics server on {} failed: {}", addr, e);
-                }
-            }))
-        } else {
-            None
-        };
-
-        crate::log_event!(INFO, crate::log::WORKER, crate::log::START,
-            sweep_interval = ?config.sweep_interval);
+        let _handle = spawn_worker_thread("imc-worker", move || {
+            crate::log_event!(INFO, crate::log::WORKER, crate::log::START,
+                "imc worker started");
+            worker_loop(rx, config);
+            crate::log_event!(INFO, crate::log::WORKER, crate::log::STOP,
+                "imc worker stopped");
+        });
 
         Self {
             tx,
-            _handle: handle,
+            _handle,
             #[cfg(feature = "invalidation-redis")]
-            _redis_handle: redis_handle,
+            _invalidation_handle: invalidation_handle,
             #[cfg(feature = "critical")]
             _critical_handle: critical_handle,
-            #[cfg(feature = "metrics-prometheus")]
-            _metrics_handle: metrics_handle,
         }
     }
 
-    /// Enqueue a remove-command for the given type and id.
-    pub fn remove<T: ImcCacheable>(&self, id: &T::Id) {
-        let type_id = TypeId::of::<T>();
-        let id_hash = hash_value(id);
-        let _ = self.tx.send(CacheCmd::Remove(type_id, id_hash));
+    /// Queue a remove-by-id command (non-blocking).
+    ///
+    /// The worker thread will remove the entry matching `id` during its
+    /// next command cycle.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use imc::{CacheWorker, ImcCacheable};
+    ///
+    /// #[derive(Clone)]
+    /// struct User { id: u32 }
+    /// impl ImcCacheable for User {
+    ///     type Id = u32; type Key = String;
+    ///     fn cache_id(&self) -> u32 { self.id }
+    /// }
+    ///
+    /// let worker = CacheWorker::spawn();
+    /// let _ = worker.remove::<User>(&42);
+    /// ```
+    pub fn remove<T: ImcCacheable>(&self, id: &T::Id) -> Result<(), mpsc::SendError<CacheCmd>> {
+        let id_hash = crate::hasher::hash_value(id);
+        self.tx.send(CacheCmd::Remove(TypeId::of::<T>(), id_hash))
     }
 
-    /// Enqueue a clear-command for the given type.
-    pub fn clear<T: ImcCacheable>(&self) {
-        let type_id = TypeId::of::<T>();
-        let _ = self.tx.send(CacheCmd::Clear(type_id));
-    }
-
-    /// Enqueue a clear-all command (evicts every namespace).
-    pub fn clear_all(&self) {
-        let _ = self.tx.send(CacheCmd::ClearAll);
+    /// Send a command to the worker thread (non-blocking).
+    ///
+    /// Returns `Err` when the worker has already shut down.
+    pub fn send(&self, cmd: CacheCmd) -> Result<(), mpsc::SendError<CacheCmd>> {
+        self.tx.send(cmd)
     }
 }
 
 impl Drop for CacheWorker {
     fn drop(&mut self) {
-        *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = self.tx.send(CacheCmd::Shutdown);
-        crate::log_event!(INFO, crate::log::WORKER, crate::log::STOP);
+        *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::metrics::set_entries(0);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Background loop
+// Worker loop
 // ---------------------------------------------------------------------------
 
-pub(crate) fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
-    let sweep_interval = config.sweep_interval;
-
+fn worker_loop(rx: Receiver<CacheCmd>, config: WorkerConfig) {
     loop {
-        match rx.recv_timeout(sweep_interval) {
-            Ok(cmd) => match cmd {
-                CacheCmd::Remove(type_id, id_hash) => {
-                    let mut stores = global().stores.write().unwrap();
-                    if let Some(cache) = stores.get_mut(&type_id) {
-                        cache.remove_data(id_hash);
-                        crate::log_event!(DEBUG, crate::log::WORKER, crate::log::REMOVE,
-                            type_id = ?type_id, id_hash = id_hash);
-                    }
+        let result = rx.recv_timeout(config.sweep_interval);
+
+        match result {
+            Ok(CacheCmd::Remove(type_id, id_hash)) => {
+                let mut stores = global().stores.write().unwrap();
+                if let Some(cache) = stores.get_mut(&type_id) {
+                    cache.remove_data(id_hash);
                 }
-                CacheCmd::Clear(type_id) => {
-                    let mut stores = global().stores.write().unwrap();
-                    if let Some(cache) = stores.get_mut(&type_id) {
-                        cache.clear();
-                        crate::log_event!(INFO, crate::log::WORKER, crate::log::CLEAR,
-                            type_id = ?type_id);
-                    }
+            }
+            Ok(CacheCmd::Clear(type_id)) => {
+                let mut stores = global().stores.write().unwrap();
+                if let Some(cache) = stores.get_mut(&type_id) {
+                    cache.clear();
                 }
-                CacheCmd::ClearAll => {
-                    let mut stores = global().stores.write().unwrap();
-                    stores.clear();
-                    crate::log_event!(INFO, crate::log::WORKER, crate::log::CLEAR, all = true);
-                }
-                CacheCmd::Shutdown => {
-                    crate::log_event!(INFO, crate::log::WORKER, crate::log::STOP, reason = "shutdown");
-                    return;
-                }
-            },
+            }
+            Ok(CacheCmd::ClearAll) => {
+                let mut stores = global().stores.write().unwrap();
+                stores.clear();
+            }
+            Ok(CacheCmd::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        sweep_all();
+        // Periodic sweep
+        sweep_all(&global().stores);
+
+        // Update metrics gauge
+        let total: usize = {
+            let stores = global().stores.read().unwrap();
+            stores.values().map(|c| c.len()).sum()
+        };
+        crate::metrics::set_entries(total);
     }
 }
 
-pub(crate) fn sweep_all() {
-    let type_ids: Vec<TypeId> = {
-        let stores = global().stores.read().unwrap();
-        stores.keys().copied().collect()
-    };
-
-    for type_id in type_ids {
-        let mut stores = global().stores.write().unwrap();
-        if let Some(cache) = stores.get_mut(&type_id) {
-            cache.remove_expired();
-            cache.evict_to_max_size();
-            crate::metrics::set_entries(cache.len());
-        }
+fn sweep_all(
+    stores: &std::sync::RwLock<std::collections::HashMap<TypeId, crate::cache::PerTypeCache>>,
+) {
+    let mut stores = stores.write().unwrap();
+    for cache in stores.values_mut() {
+        cache.remove_expired();
+        cache.evict_to_max_size();
     }
 }
