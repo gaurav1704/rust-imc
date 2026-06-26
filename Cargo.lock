@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "imc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "imc-derive",
  "prometheus",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "imc-derive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "proc-macro2",
  "quote",
