@@ -726,7 +726,6 @@ mod critical_tests {
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::time::Duration;
 
-    use imc_derive::CriticalKey;
     use crate::CriticalKey;
     use crate::*;
 

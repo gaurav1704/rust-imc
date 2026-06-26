@@ -21,7 +21,7 @@ metrics-prometheus = ["dep:prometheus"]
 critical = ["invalidation-redis", "dep:imc-derive"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["critical", "async", "invalidation-redis", "logging", "metrics-prometheus"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]

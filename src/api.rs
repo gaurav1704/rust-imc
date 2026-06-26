@@ -179,7 +179,11 @@ macro_rules! keyed_body {
 /// use std::time::Duration;
 /// use imc::{ImcCacheable, CacheStrategy, through_imc_keyed};
 ///
+/// #[cfg(feature = "critical")]
+/// use imc::CriticalKey;
+///
 /// #[derive(Hash, Clone, Debug, PartialEq)]
+/// #[cfg_attr(feature = "critical", derive(CriticalKey))]
 /// enum UserKey { ById(i32), ByEmail(String) }
 ///
 /// #[derive(Clone, Debug, PartialEq)]

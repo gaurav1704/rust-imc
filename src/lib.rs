@@ -93,7 +93,7 @@
 //!
 //! # Re-exports
 //!
-//! The [`CriticalKey`](crate::CriticalKey) derive macro is provided by
+//! The [`CriticalKey`] derive macro is provided by
 //! the `imc-derive` crate and re-exported here for convenience:
 //!
 //! ```rust,ignore
